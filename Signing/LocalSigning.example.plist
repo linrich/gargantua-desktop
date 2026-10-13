@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CertificateSHA1</key><string>REPLACE_WITH_YOUR_40_CHARACTER_UPPERCASE_SHA1</string>
+    <key>TeamIdentifier</key><string>REPLACE_WITH_YOUR_TEAM_ID</string>
+    <key>BundleIdentifier</key><string>local.gargantua.desktop</string>
+</dict></plist>
