@@ -1,0 +1,15 @@
+.build/
+build/
+.swiftpm/
+.DS_Store
+__pycache__/
+*.pyc
+*.log
+Signing/LocalSigning.plist
+*.p12
+*.pfx
+*.key
+*.mobileprovision
+*.provisionprofile
+.env
+.env.*
