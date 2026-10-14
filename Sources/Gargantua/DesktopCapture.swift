@@ -10,10 +10,11 @@ import CoreVideo
 final class DesktopFrame {
     let texture: MTLTexture
     let displayID: CGDirectDisplayID
+    let sequence: UInt64
     private let pixelBuffer: CVPixelBuffer
     private let metalImage: CVMetalTexture
-    init(texture: MTLTexture, displayID: CGDirectDisplayID, pixelBuffer: CVPixelBuffer, metalImage: CVMetalTexture) {
-        self.texture=texture;self.displayID=displayID;self.pixelBuffer=pixelBuffer;self.metalImage=metalImage
+    init(texture: MTLTexture, displayID: CGDirectDisplayID, sequence: UInt64, pixelBuffer: CVPixelBuffer, metalImage: CVMetalTexture) {
+        self.texture=texture;self.displayID=displayID;self.sequence=sequence;self.pixelBuffer=pixelBuffer;self.metalImage=metalImage
     }
 }
 
@@ -30,6 +31,8 @@ final class DesktopCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     private var activeID: ObjectIdentifier?
     private var activeDisplay: CGDirectDisplayID=0
     private var latest: DesktopFrame?
+    // Only the serial sample queue advances this; do not reset on stop/restart.
+    private var frameSequence: UInt64 = 0
     var onStatus: ((String)->Void)?
     var onFailure: ((String)->Void)?
 
@@ -124,7 +127,8 @@ final class DesktopCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         let result=CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault,cache,pixels,nil,.bgra8Unorm,
             CVPixelBufferGetWidth(pixels),CVPixelBufferGetHeight(pixels),0,&image)
         guard result==kCVReturnSuccess,let image,let texture=CVMetalTextureGetTexture(image) else {return}
-        let frame=DesktopFrame(texture:texture,displayID:displayID,pixelBuffer:pixels,metalImage:image)
+        frameSequence &+= 1
+        let frame=DesktopFrame(texture:texture,displayID:displayID,sequence:frameSequence,pixelBuffer:pixels,metalImage:image)
         lock.lock()
         let first=activeID==ObjectIdentifier(stream) && latest==nil
         if activeID==ObjectIdentifier(stream) {latest=frame}

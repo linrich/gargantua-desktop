@@ -8,6 +8,7 @@ zsh Scripts/build.sh
 "$PROJECT_DIR/build/Gargantua.app/Contents/MacOS/Gargantua" --instance-test "$PROJECT_DIR/build/verification"
 "$PROJECT_DIR/build/Gargantua.app/Contents/MacOS/Gargantua" --self-test "$PROJECT_DIR/build/verification"
 "$PROJECT_DIR/build/Gargantua.app/Contents/MacOS/Gargantua" --desktop-test "$PROJECT_DIR/build/verification"
+"$PROJECT_DIR/build/Gargantua.app/Contents/MacOS/Gargantua" --refresh-test "$PROJECT_DIR/build/verification"
 "$PROJECT_DIR/build/Gargantua.app/Contents/MacOS/Gargantua" --performance-test "$PROJECT_DIR/build/verification"
 python3 Tests/verify_kerr_reference.py
 python3 Tests/verify_bundle_reference.py

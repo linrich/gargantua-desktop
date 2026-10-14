@@ -243,6 +243,15 @@ if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--instance-l
     catch {
         FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8)); exit(1)
     }
+} else if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--refresh-test" {
+    do {
+        let output=URL(fileURLWithPath:CommandLine.arguments[2],isDirectory:true)
+        try FileManager.default.createDirectory(at:output,withIntermediateDirectories:true)
+        try runDesktopRefreshChecks(output:output)
+        print("背景刷新优化检查通过（仅生成背景）。")
+    } catch {
+        FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8));exit(1)
+    }
 } else if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--performance-test" {
     do {
         let output = URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true)

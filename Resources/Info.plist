@@ -2,13 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
     <key>CFBundleName</key><string>Gargantua</string>
-    <key>NSHumanReadableCopyright</key><string>Copyright (C) 2026 linrich. GPL-3.0-only. No warranty. See LICENSE in Contents/Resources.</string>
     <key>CFBundleDisplayName</key><string>Gargantua · 卡冈图雅</string>
     <key>CFBundleIdentifier</key><string>local.gargantua.desktop</string>
     <key>CFBundleExecutable</key><string>Gargantua</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.9.4</string>
-    <key>CFBundleVersion</key><string>21</string>
+    <key>CFBundleShortVersionString</key><string>0.9.5</string>
+    <key>CFBundleVersion</key><string>22</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>LSUIElement</key><true/>
     <key>NSHighResolutionCapable</key><true/>

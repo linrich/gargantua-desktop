@@ -104,7 +104,11 @@ final class BlackHoleRenderer: NSObject, MTKViewDelegate {
     var useReferenceFiltering = false
     private var animationClock = AnimationClock(wallTime: CACurrentMediaTime())
     private let inFlight = DispatchSemaphore(value: 2)
-    var suspended = false { didSet { animationClock.synchronize(to: CACurrentMediaTime()) } }
+    private var desktopRefresh = DesktopRefreshState()
+    var suspended = false { didSet {
+        animationClock.synchronize(to: CACurrentMediaTime())
+        if suspended { desktopRefresh.invalidate() }
+    } }
     var onFailure: ((String) -> Void)?
 
     init(settings: Settings, backgroundOnly: Bool = false) throws {
@@ -179,10 +183,28 @@ final class BlackHoleRenderer: NSObject, MTKViewDelegate {
         }
     }
 
-    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
+    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+        desktopRefresh.invalidate()
+    }
+
+    func desktopRefreshKey(sequence: UInt64?, size: SIMD2<Int>) -> DesktopRefreshKey {
+        DesktopRefreshKey(sequence: sequence, outputSize: size, rect: desktopRect,
+                          viewport: desktopViewport, spin: Float(settings.spin),
+                          inclination: Float(settings.inclination), strength: Float(settings.desktopStrength),
+                          enabled: settings.desktopLensing)
+    }
 
     func draw(in view: MTKView) {
         guard !suspended else {return}
+        // Snapshot once: the sequence tested here and the texture encoded below
+        // must belong to the same capture frame even if a new frame arrives.
+        let frame = settings.desktopLensing ? desktopFrameProvider?() : nil
+        let key = desktopRefreshKey(sequence: frame?.sequence,
+                                    size: SIMD2(Int(view.drawableSize.width), Int(view.drawableSize.height)))
+        // Keep the existing timer and immediate drag transactions, but leave
+        // the last presented surface intact while its inputs are unchanged.
+        // Skip BEFORE acquiring a drawable, semaphore or GPU command buffer.
+        if backgroundOnly && !desktopRefresh.needsDraw(key) { return }
         // A position transaction must not move a panel while silently dropping
         // its replacement pixels. GPU completion releases the gate off-thread.
         let deadline:DispatchTime=view.presentsWithTransaction ? .distantFuture:.now()
@@ -193,12 +215,15 @@ final class BlackHoleRenderer: NSObject, MTKViewDelegate {
         let now = CACurrentMediaTime()
         let elapsed=animationClock.advance(to:now,rate:settings.effectiveSpeed,paused:settings.paused)
         do {
-            try encode(command: command, target: drawable.texture, time: Float(elapsed),liveDesktop:true,sceneSize:liveSceneSize)
+            try encode(command: command, target: drawable.texture, time: Float(elapsed),frame:frame,sceneSize:liveSceneSize)
             let gate = inFlight
             command.addCompletedHandler { [weak self] buffer in
                 gate.signal()
                 if let error = buffer.error {
-                    DispatchQueue.main.async { self?.onFailure?(error.localizedDescription) }
+                    DispatchQueue.main.async {
+                        self?.desktopRefresh.invalidate()
+                        self?.onFailure?(error.localizedDescription)
+                    }
                 }
             }
             if view.presentsWithTransaction {
@@ -211,6 +236,7 @@ final class BlackHoleRenderer: NSObject, MTKViewDelegate {
                 command.present(drawable)
                 command.commit()
             }
+            if backgroundOnly { desktopRefresh.didSubmit(key) }
         } catch {
             inFlight.signal(); onFailure?(error.localizedDescription)
         }
@@ -235,9 +261,9 @@ final class BlackHoleRenderer: NSObject, MTKViewDelegate {
         return desc
     }
 
-    private func encode(command: MTLCommandBuffer, target: MTLTexture, time: Float, background: Float = 0, liveDesktop: Bool = false, sceneSize: SIMD2<Int>? = nil) throws {
+    private func encode(command: MTLCommandBuffer, target: MTLTexture, time: Float, background: Float = 0, frame: DesktopFrame? = nil, sceneSize: SIMD2<Int>? = nil) throws {
         if backgroundOnly {
-            try encodeBackground(command:command,target:target,background:background,liveDesktop:liveDesktop)
+            try encodeBackground(command:command,target:target,background:background,frame:frame)
             return
         }
         let width = sceneSize?.x ?? target.width, height = sceneSize?.y ?? target.height
@@ -335,7 +361,6 @@ final class BlackHoleRenderer: NSObject, MTKViewDelegate {
         }
         // Capture surfaces must outlive the asynchronous GPU command. Never
         // retain a live frame in the geometry or material caches.
-        let frame=liveDesktop && settings.desktopLensing ? desktopFrameProvider?():nil
         let desktop=settings.desktopLensing ? (syntheticDesktop ?? frame?.texture):nil
         var compositeUniforms=u
         compositeUniforms.resolution=SIMD2(Float(target.width),Float(target.height))
@@ -388,8 +413,7 @@ final class BlackHoleRenderer: NSObject, MTKViewDelegate {
     // Stationary, mouse-transparent surface; only the local scissor is shaded.
     // No disk/PSF allocation
     // or animation work is done here; the original foreground view is unchanged.
-    private func encodeBackground(command: MTLCommandBuffer, target: MTLTexture, background: Float, liveDesktop: Bool) throws {
-        let frame=liveDesktop && settings.desktopLensing ? desktopFrameProvider?():nil
+    private func encodeBackground(command: MTLCommandBuffer, target: MTLTexture, background: Float, frame: DesktopFrame?) throws {
         let desktop=settings.desktopLensing ? (syntheticDesktop ?? frame?.texture):nil
         if let frame {command.addCompletedHandler {_ in withExtendedLifetime(frame) {}}}
         var u=Uniforms(resolution:SIMD2(Float(target.width),Float(target.height)),time:0,exposure:1,
@@ -661,6 +685,71 @@ final class BlackHoleRenderer: NSObject, MTKViewDelegate {
             maxGrayDifference=max(maxGrayDifference,abs(rgb[0]-rgb[1]),abs(rgb[1]-rgb[2]))
         }
         return ["linear_luminance_sum":sum,"invalid_pixels":invalid,"max_gray_difference":maxGrayDifference]
+    }
+
+    // Synthetic input replay, without display/capture access. Both paths use
+    // this same renderer; only the unchanged-frame submission gate differs.
+    func benchmarkDesktopRefresh(width: Int, height: Int, ticks: Int, newFrameEvery: Int,
+                                 moving: Bool, optimized: Bool) throws -> [String: Any] {
+        precondition(backgroundOnly && ticks > 0 && newFrameEvery > 0)
+        let target = try texture(width,height,.bgra8Unorm)
+        let originalViewport = desktopViewport
+        defer { desktopViewport = originalViewport }
+        for _ in 0..<2 {
+            guard let command=diagnosticCommand() else {throw RenderError.unavailable("背景性能预热失败。")}
+            try encode(command:command,target:target,time:0)
+            command.commit();command.waitUntilCompleted();try checkedError(command)
+        }
+        var state = DesktopRefreshState(), gpu = [Double]()
+        let start = CACurrentMediaTime()
+        for tick in 0..<ticks {
+            desktopViewport = originalViewport
+            if moving { desktopViewport.x += Float(tick % 20) / Float(width) }
+            let key = desktopRefreshKey(sequence:UInt64(tick/newFrameEvery+1),size:SIMD2(width,height))
+            if optimized && !state.needsDraw(key) { continue }
+            guard let command=diagnosticCommand() else {throw RenderError.unavailable("背景性能测量失败。")}
+            try encode(command:command,target:target,time:0)
+            command.commit();state.didSubmit(key)
+            command.waitUntilCompleted();try checkedError(command)
+            gpu.append((command.gpuEndTime-command.gpuStartTime)*1000)
+        }
+        let sorted=gpu.sorted()
+        return ["ticks":ticks,"submitted":gpu.count,"skipped":ticks-gpu.count,
+                "gpu_total_ms":gpu.reduce(0,+),"gpu_samples_ms":gpu,
+                "gpu_median_ms":sorted[sorted.count/2],"gpu_p95_ms":sorted[Int(Double(sorted.count-1)*0.95)],
+                "wall_total_ms":(CACurrentMediaTime()-start)*1000]
+    }
+
+    // Interleave individual frames to reduce the timing drift observed in
+    // whole-run ABBA tests. All inputs change here, so neither path may skip.
+    func compareChangingDesktop(width: Int, height: Int, moving: Bool) throws -> [String: Any] {
+        precondition(backgroundOnly)
+        let target=try texture(width,height,.bgra8Unorm),origin=desktopViewport
+        defer { desktopViewport=origin }
+        var state=DesktopRefreshState(),before=[Double](),after=[Double]()
+        for cycle in 0..<160 {
+            for (step,optimized) in [false,true,true,false].enumerated() {
+                let tick=cycle*4+step
+                desktopViewport=origin
+                if moving {desktopViewport.x += Float(tick%20)/Float(width)}
+                let key=desktopRefreshKey(sequence:UInt64(tick+1),size:SIMD2(width,height))
+                guard !optimized || state.needsDraw(key) else {throw RenderError.unavailable("动态背景被错误跳过。")}
+                guard let command=diagnosticCommand() else {throw RenderError.unavailable("交替计时指令失败。")}
+                try encode(command:command,target:target,time:0)
+                command.commit();state.didSubmit(key)
+                command.waitUntilCompleted();try checkedError(command)
+                if cycle>=10 {
+                    let value=(command.gpuEndTime-command.gpuStartTime)*1000
+                    if optimized {after.append(value)} else {before.append(value)}
+                }
+            }
+        }
+        func stats(_ values:[Double]) -> [String:Any] {
+            let sorted=values.sorted()
+            return ["submitted":values.count,"median_ms":sorted[sorted.count/2],
+                    "p95_ms":sorted[Int(Double(sorted.count-1)*0.95)],"samples_ms":values]
+        }
+        return ["baseline":stats(before),"optimized":stats(after)]
     }
 
     func benchmark(width: Int, height: Int, frames: Int = 24, lensOnly: Bool = false) throws -> [String: Any] {
