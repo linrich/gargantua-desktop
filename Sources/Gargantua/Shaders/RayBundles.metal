@@ -126,15 +126,11 @@ kernel void beamGeometry(texture2d<float,access::write> primary [[texture(0)]],
 }
 // Cache a 4x4 grid at visibility / image-branch boundaries, and a 2x2 grid
 // for large smooth footprints. The upper index bits encode the grid size.
-kernel void refineBeams(texture2d<float,access::read> primary [[texture(0)]],
-                        texture2d<float,access::read> info [[texture(1)]],
-                        texture2d<float,access::read> dx [[texture(2)]],
-                        texture2d<float,access::read> dy [[texture(3)]],
-                        texture2d<uint,access::write> indices [[texture(4)]],
-                        device Beam *atlas [[buffer(0)]], device atomic_uint *counter [[buffer(1)]],
-                        constant uint &capacity [[buffer(2)]],constant Uniforms &u [[buffer(3)]],
-                        uint2 tid [[thread_position_in_grid]]) {
-    if(any(tid>=uint2(u.resolution)))return;
+// Shared classification: counting and refinement must request identical grids.
+uint refinedBeamGrid(texture2d<float,access::read> info,
+                     texture2d<float,access::read> dx,
+                     texture2d<float,access::read> dy,
+                     constant Uniforms &u, uint2 tid) {
     float4 center=info.read(tid); bool split=center.x>=4;
     for(int k=0;k<4;++k){
         int2 offset=k==0?int2(2,0):k==1?int2(-2,0):k==2?int2(0,2):int2(0,-2);
@@ -154,9 +150,30 @@ kernel void refineBeams(texture2d<float,access::read> primary [[texture(0)]],
     // edge detector when measuring convergence and missed subpixel features.
     if(u.edgeGrid>4)edge=true;
     split=split||edge;
+    return split ? (edge ? uint(u.edgeGrid) : 2u) : 0u;
+}
+kernel void countRefinedBeams(texture2d<float,access::read> info [[texture(0)]],
+                              texture2d<float,access::read> dx [[texture(1)]],
+                              texture2d<float,access::read> dy [[texture(2)]],
+                              device atomic_uint *counter [[buffer(0)]],
+                              constant Uniforms &u [[buffer(1)]], uint2 tid [[thread_position_in_grid]]) {
+    if(any(tid>=uint2(u.resolution)))return;
+    uint grid=refinedBeamGrid(info,dx,dy,u,tid);
+    if(grid)atomic_fetch_add_explicit(counter+3,grid*grid,memory_order_relaxed);
+}
+kernel void refineBeams(texture2d<float,access::read> primary [[texture(0)]],
+                        texture2d<float,access::read> info [[texture(1)]],
+                        texture2d<float,access::read> dx [[texture(2)]],
+                        texture2d<float,access::read> dy [[texture(3)]],
+                        texture2d<uint,access::write> indices [[texture(4)]],
+                        device Beam *atlas [[buffer(0)]], device atomic_uint *counter [[buffer(1)]],
+                        constant uint &capacity [[buffer(2)]],constant Uniforms &u [[buffer(3)]],
+                        uint2 tid [[thread_position_in_grid]]) {
+    if(any(tid>=uint2(u.resolution)))return;
+    uint grid=refinedBeamGrid(info,dx,dy,u,tid);
     uint slot=0xffffffff;
-    if(split) {
-        uint grid=edge?uint(u.edgeGrid):2, samples=grid*grid;
+    if(grid) {
+        uint samples=grid*grid;
         atomic_fetch_add_explicit(counter,1,memory_order_relaxed);
         uint index=atomic_fetch_add_explicit(counter+3,samples,memory_order_relaxed);
         if(index+samples<=capacity) {
@@ -300,8 +317,13 @@ float4 ewa(texture2d<float> tex,float2 uv,float2 jx,float2 jy,bool enabled,bool 
     }
     return weight>1.e-7?sum/weight:tex.sample(bilinear,uv,level(lod));
 }
+// Only specialize the EWA enabled/reference switches. Keep shutter, cloud
+// evolution, frequency colour and every floating-point expression unchanged.
+constant bool diskFixedSampling [[function_constant(3)]];
 float3 beamEmission(Beam b,texture2d<float> material,Uniforms u){
     if(b.info.x!=1)return float3(0);
+    bool fixed=false;
+    if(is_function_constant_defined(diskFixedSampling))fixed=diskFixedSampling;
     float r=b.hit.x, r32=pow(r,1.5), sense=u.spin<0?-1.0:1.0;
     float omega=sense/(r32+abs(u.spin)), omprime=-sense*1.5*sqrt(r)/pow(r32+abs(u.spin),2.0);
     float4 total=0;
@@ -327,7 +349,7 @@ float3 beamEmission(Beam b,texture2d<float> material,Uniforms u){
             float2 x=float2(b.dx.y+omega*b.dx.w-omprime*age*b.dx.x,b.dx.x);
             float2 y=float2(b.dy.y+omega*b.dy.w-omprime*age*b.dy.x,b.dy.x);
             float weight=u.materialEvolution>.5?(layer==0?1-blend:blend):1;
-            value+=weight*ewa(material,float2(phase,r)*units,x*units,y*units,u.beams>.5,u.beams>1.5);
+            value+=weight*ewa(material,float2(phase,r)*units,x*units,y*units,fixed||u.beams>.5,!fixed&&u.beams>1.5);
         }
         total+=value*(instantaneous?1.0:(i==1?4.0/9.0:5.0/18.0));
     }

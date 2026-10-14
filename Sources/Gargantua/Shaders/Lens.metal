@@ -165,3 +165,49 @@ kernel void fftStagePairFinish(texture2d<float,access::read> source [[texture(0)
     float factor=u.inverse!=0&&u.span==n?1.0/float(n):1.0;
     fftCroppedWrite((a+wb)*factor,q,dest,scene);fftCroppedWrite((a-wb)*factor,k,dest,scene);
 }
+
+// The PSF is one complex scalar shared by R/G/B. Its second complex pair in
+// the old RGBA32 spectrum was an exact duplicate and was never read.
+kernel void fftStoreSpectrum(texture2d<float,access::read> source [[texture(0)]],
+                             texture2d<float,access::write> dest [[texture(1)]],uint2 p [[thread_position_in_grid]]) {
+    if(p.x<dest.get_width()&&p.y<dest.get_height())dest.write(source.read(p),p);
+}
+
+
+// Grouped columns: keep every butterfly and Float32 store while
+// interleaving neighbouring columns in a SIMD group for texture locality.
+constant uint fftColumnCount [[function_constant(2)]];
+kernel void fftBlockColumns(texture2d<float,access::read> source [[texture(0)]],
+                            texture2d<float,access::write> dest [[texture(1)]],
+                            constant FFTParams &u [[buffer(0)]],threadgroup float4 *tile [[threadgroup(0)]],
+                            uint tid [[thread_index_in_threadgroup]],uint2 group [[threadgroup_position_in_grid]],
+                            uint simdWidth [[threads_per_simdgroup]]) {
+    uint columns=fftColumnCount,lane=tid/columns,column=tid%columns;
+    uint n=u.height,block=u.span,base=group.x*block,x=group.y*columns+column;
+    uint r0=reverse_bits(base+lane)>>(32-u.bits),r1=reverse_bits(base+lane+block/2)>>(32-u.bits);
+    float4 v0=source.read(uint2(x,r0)),v1=source.read(uint2(x,r1));
+    uint registerSpan=min(simdWidth/columns,block/2);
+    for(uint span=2;span<=registerSpan;span*=2) {
+        uint halfSpan=span/2,j=lane%halfSpan;
+        float angle=(u.inverse!=0?2.0:-2.0)*M_PI_F*float(j)/float(span);
+        float2 w=float2(cos(angle),sin(angle));
+        bool upper=lane%span>=halfSpan;
+        v0=fftRegisterButterfly(v0,w,halfSpan*columns,upper);
+        v1=fftRegisterButterfly(v1,w,halfSpan*columns,upper);
+    }
+    tile[lane*columns+column]=v0;tile[(lane+block/2)*columns+column]=v1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for(uint span=registerSpan*2;span<=block;span*=2) {
+        uint halfSpan=span/2,j=lane%halfSpan,lo=(lane/halfSpan*span+j)*columns+column,hi=lo+halfSpan*columns;
+        float angle=(u.inverse!=0?2.0:-2.0)*M_PI_F*float(j)/float(span);
+        float2 w=float2(cos(angle),sin(angle));float4 a=tile[lo],b=tile[hi];
+        float4 wb=float4(cmul(b.xy,w),cmul(b.zw,w));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        tile[lo]=a+wb;tile[hi]=a-wb;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for(uint i=lane;i<block;i+=block/2) {
+        float4 value=tile[i*columns+column];if(u.inverse!=0&&block==n)value/=float(n);
+        dest.write(value,uint2(x,base+i));
+    }
+}
