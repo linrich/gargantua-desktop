@@ -35,6 +35,8 @@ final class DesktopCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     private var frameSequence: UInt64 = 0
     var onStatus: ((String)->Void)?
     var onFailure: ((String)->Void)?
+    // Callback carries no surface and must be safe on either delivery queue.
+    var onFrameChanged: (() -> Void)?
 
     init(device: MTLDevice) {
         super.init()
@@ -108,7 +110,8 @@ final class DesktopCapture: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func stop() {
         generation+=1;wantedDisplay=nil;wantedWindowIDs=[]
-        lock.lock();activeID=nil;latest=nil;lock.unlock()
+        lock.lock();let hadFrame=latest != nil;activeID=nil;latest=nil;lock.unlock()
+        if hadFrame { onFrameChanged?() }
         let old=stream;stream=nil
         if let old {Task {try? await old.stopCapture()}}
         if let cache {CVMetalTextureCacheFlush(cache,0)}
@@ -120,8 +123,10 @@ final class DesktopCapture: NSObject, SCStreamOutput, SCStreamDelegate {
               let raw=attachments.first?[.status] as? Int,let status=SCFrameStatus(rawValue:raw) else {return}
         lock.lock()
         let current=activeID==ObjectIdentifier(stream),displayID=activeDisplay
-        if current && (status == .blank || status == .suspended || status == .stopped) {latest=nil}
+        let cleared=current && latest != nil && (status == .blank || status == .suspended || status == .stopped)
+        if cleared {latest=nil}
         lock.unlock()
+        if cleared {onFrameChanged?()}
         guard current,status == .complete,let pixels=sampleBuffer.imageBuffer,let cache else {return}
         var image: CVMetalTexture?
         let result=CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault,cache,pixels,nil,.bgra8Unorm,
@@ -130,9 +135,11 @@ final class DesktopCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         frameSequence &+= 1
         let frame=DesktopFrame(texture:texture,displayID:displayID,sequence:frameSequence,pixelBuffer:pixels,metalImage:image)
         lock.lock()
-        let first=activeID==ObjectIdentifier(stream) && latest==nil
-        if activeID==ObjectIdentifier(stream) {latest=frame}
+        let accepted=activeID==ObjectIdentifier(stream)
+        let first=accepted && latest==nil
+        if accepted {latest=frame}
         lock.unlock()
+        if accepted {onFrameChanged?()}
         if first {
             DispatchQueue.main.async { [weak self] in
                 guard let self,self.stream === stream,self.wantedDisplay==displayID else {return}

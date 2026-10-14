@@ -30,6 +30,13 @@ final class OverlayController {
     private let backgroundView: MTKView
     private let backgroundRenderer: BlackHoleRenderer
     private let desktopCapture: DesktopCapture
+    private lazy var backgroundEvents = DesktopEventDriver { [weak self] in
+        guard let self, !self.backgroundRenderer.suspended else { return true }
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        self.backgroundView.draw()
+        CATransaction.commit()
+        return self.backgroundRenderer.desktopSurfaceIsCurrent(in:self.backgroundView)
+    }
     private var desktopDisplayID: CGDirectDisplayID=0
     private let settings: Settings
     private var asleep = false
@@ -41,7 +48,7 @@ final class OverlayController {
     init(settings: Settings) throws {
         self.settings = settings
         renderer = try BlackHoleRenderer(settings: settings)
-        backgroundRenderer = try BlackHoleRenderer(settings:settings,backgroundOnly:true)
+        backgroundRenderer = try BlackHoleRenderer(settings:settings,backgroundOnly:true,resources:renderer.resources)
         desktopCapture = DesktopCapture(device:renderer.device)
         let initialScreen=NSScreen.main?.frame.size ?? NSSize(width:1440,height:900)
         let initialWidth=min(settings.size,OverlaySizing.maximumWidth(in:initialScreen))
@@ -80,6 +87,7 @@ final class OverlayController {
         backgroundView.wantsLayer=true;backgroundView.layer?.isOpaque=false
         backgroundView.layer?.backgroundColor=NSColor.clear.cgColor;backgroundView.autoResizeDrawable=false
         backgroundView.delegate=backgroundRenderer;backgroundView.isPaused=true
+        backgroundView.enableSetNeedsDisplay=true
         // The desktop surface stays in screen coordinates. Position changes
         // update only its local lens viewport, never translate captured pixels.
         backgroundView.presentsWithTransaction=true
@@ -91,6 +99,10 @@ final class OverlayController {
             guard let self else {return nil}
             return self.desktopCapture.frame(for:self.desktopDisplayID)
         }
+        // Initialize on main before the capture queue can use the relay.
+        let events=backgroundEvents
+        desktopCapture.onFrameChanged = { [weak events] in events?.request() }
+        backgroundRenderer.onDesktopInvalidated = { [weak events] in events?.invalidate() }
         desktopCapture.onStatus = { [weak settings] in settings?.desktopStatus=$0 }
         desktopCapture.onFailure = { [weak settings] message in
             settings?.desktopLensing=false;settings?.desktopStatus=message
@@ -147,53 +159,67 @@ final class OverlayController {
                 // 30 Hz view timer or write preferences at every pointer step.
                 self?.updateDesktop()
             })
+        observers.append(NotificationCenter.default.addObserver(
+            forName:NSWindow.didChangeOcclusionStateNotification,object:backgroundWindow,queue:.main) { [weak self] _ in
+                guard let self, self.backgroundWindow.occlusionState.contains(.visible) else { return }
+                self.backgroundRenderer.invalidateDesktopSurface()
+            })
         apply()
     }
 
-    func apply() {
+    func apply(_ changes: SettingsChange = .all) {
         guard !applying else {return}
         applying=true
         defer {applying=false}
-        let old = window.frame
-        let screen = window.screen ?? NSScreen.main
-        let available = screen?.frame.size ?? NSSize(width: 1440, height: 900)
-        settings.updateSizeLimit(screenSize:available)
-        let width = min(CGFloat(settings.size),OverlaySizing.maximumWidth(in:available))
-        let size = NSSize(width: width, height: width / OverlaySizing.aspect)
-        if abs(old.width - width) > 0.5 {
-            window.setFrame(NSRect(x: old.midX - size.width / 2, y: old.midY - size.height / 2,
-                                   width: size.width, height: size.height), display: true)
-            keepOnScreen()
+        if changes.contains(.layout) {
+            let old = window.frame
+            let screen = window.screen ?? NSScreen.main
+            let available = screen?.frame.size ?? NSSize(width: 1440, height: 900)
+            settings.updateSizeLimit(screenSize:available)
+            let width = min(CGFloat(settings.size),OverlaySizing.maximumWidth(in:available))
+            let size = NSSize(width: width, height: width / OverlaySizing.aspect)
+            if abs(old.width - width) > 0.5 {
+                window.setFrame(NSRect(x: old.midX - size.width / 2, y: old.midY - size.height / 2,
+                                       width: size.width, height: size.height), display: true)
+                keepOnScreen()
+            }
+            // Use the actual point width, including screen-fit constraints, rather
+            // than texture pixels or the slider's requested size.
+            if settings.displayedWidth != Double(window.frame.width) {
+                settings.displayedWidth = Double(window.frame.width)
+            }
+            let scale = min(window.backingScaleFactor, settings.quality.pixelScale)
+            let cap = min(1.0, Double(RenderDetail.maximumWidth) / (size.width * scale))
+            let drawable = CGSize(width: max(1, (size.width * scale * cap).rounded()),
+                                  height: max(1, (size.height * scale * cap).rounded()))
+            renderer.liveSceneSize=SIMD2(Int(drawable.width),Int(drawable.height))
+            // Keep foreground composition at backing resolution while lensing.
+            // Disk/PSF textures retain the selected quality; the desktop now has its
+            // own native-resolution surface, independent of this panel's bounds.
+            let nativeCap=min(1.0,Double(RenderDetail.maximumWidth)/(size.width*window.backingScaleFactor))
+            let native=CGSize(width:max(1,(size.width*window.backingScaleFactor*nativeCap).rounded()),
+                              height:max(1,(size.height*window.backingScaleFactor*nativeCap).rounded()))
+            let output=settings.desktopLensing ? native:drawable
+            if view.drawableSize != output { view.drawableSize = output }
+            let resolution = "\(Int(drawable.width)) × \(Int(drawable.height)) 像素"
+            if settings.renderResolution != resolution { settings.renderResolution = resolution }
         }
-        // Use the actual point width, including screen-fit constraints, rather
-        // than texture pixels or the slider's requested size.
-        if settings.displayedWidth != Double(window.frame.width) {
-            settings.displayedWidth = Double(window.frame.width)
+        if changes.contains(.window) {
+            if window.ignoresMouseEvents != settings.clickThrough { window.ignoresMouseEvents = settings.clickThrough }
+            let level: NSWindow.Level = settings.alwaysOnTop ? .floating : .normal
+            if window.level != level { window.level = level }
+            if settings.visible { raiseTogether() } else { window.orderOut(nil) }
         }
-        window.ignoresMouseEvents = settings.clickThrough
-        window.level = settings.alwaysOnTop ? .floating : .normal
-        view.preferredFramesPerSecond = settings.targetFPS
-        let scale = min(window.backingScaleFactor, settings.quality.pixelScale)
-        let cap = min(1.0, Double(RenderDetail.maximumWidth) / (size.width * scale))
-        let drawable = CGSize(width: max(1, (size.width * scale * cap).rounded()),
-                              height: max(1, (size.height * scale * cap).rounded()))
-        renderer.liveSceneSize=SIMD2(Int(drawable.width),Int(drawable.height))
-        // Keep foreground composition at backing resolution while lensing.
-        // Disk/PSF textures retain the selected quality; the desktop now has its
-        // own native-resolution surface, independent of this panel's bounds.
-        let nativeCap=min(1.0,Double(RenderDetail.maximumWidth)/(size.width*window.backingScaleFactor))
-        let native=CGSize(width:max(1,(size.width*window.backingScaleFactor*nativeCap).rounded()),
-                          height:max(1,(size.height*window.backingScaleFactor*nativeCap).rounded()))
-        let output=settings.desktopLensing ? native:drawable
-        if view.drawableSize != output { view.drawableSize = output }
-        let resolution = "\(Int(drawable.width)) × \(Int(drawable.height)) 像素"
-        if settings.renderResolution != resolution { settings.renderResolution = resolution }
-        renderer.suspended = !settings.visible || asleep || sessionInactive
-        // Desktop animation is handled by its separate stationary surface.
-        view.isPaused = settings.paused || settings.speed == 0 || renderer.suspended || settings.rendererError != nil
-        updateDesktop()
-        if settings.visible { raiseTogether() } else { window.orderOut(nil) }
-        if (settings.paused || settings.speed == 0) && !renderer.suspended && settings.rendererError == nil { view.draw() }
+        if changes.contains(.playback) {
+            view.preferredFramesPerSecond = settings.targetFPS
+            renderer.suspended = !settings.visible || asleep || sessionInactive
+            // Synchronize on pause/resume and speed/size changes; appearance
+            // sliders no longer reset animation time or the draw timer.
+            view.isPaused = settings.paused || settings.speed == 0 || renderer.suspended || settings.rendererError != nil
+        }
+        if changes.contains(.desktop) { updateDesktop() }
+        if !changes.intersection([.appearance, .layout, .playback]).isEmpty &&
+            (settings.paused || settings.speed == 0) && !renderer.suspended && settings.rendererError == nil { view.draw() }
     }
 
     func center() {
@@ -231,6 +257,7 @@ final class OverlayController {
     private func updateDesktop() {
         guard let screen=window.screen ?? NSScreen.main else {
             backgroundWindow.orderOut(nil);backgroundView.isPaused=true;backgroundRenderer.suspended=true
+            backgroundEvents.setActive(false,fps:settings.targetFPS)
             desktopCapture.configure(displayID:nil);return
         }
         // Moving/cropping an NSWindow can expose its previous texture at the
@@ -248,7 +275,8 @@ final class OverlayController {
         backgroundRenderer.desktopRect=desktopRect
         backgroundRenderer.desktopViewport=viewport
         if backgroundRenderer.suspended != !active {backgroundRenderer.suspended = !active}
-        if backgroundView.isPaused != !active {backgroundView.isPaused = !active}
+        // Never unpause this view: new frames and state changes drive it.
+        backgroundEvents.setActive(active,fps:min(30,settings.quality.fps))
         if active {
             let needsOrdering = !backgroundWindow.isVisible || backgroundWindow.level != window.level
             if backgroundWindow.frame != backgroundFrame {backgroundWindow.setFrame(backgroundFrame,display:false)}
@@ -263,6 +291,7 @@ final class OverlayController {
                 backgroundWindow.order(.below,relativeTo:window.windowNumber)
             }
             if positionChanged || needsOrdering {backgroundView.draw()}
+            backgroundEvents.request()
         } else {
             if backgroundWindow.isVisible {backgroundWindow.orderOut(nil)}
         }
@@ -271,9 +300,10 @@ final class OverlayController {
         if settings.desktopLensing && !active {settings.desktopStatus="已暂停桌面采集（隐藏、休眠或扭曲强度为 0）"}
     }
 
-    func stopCapture() {desktopCapture.stop()}
+    func stopCapture() {backgroundEvents.setActive(false,fps:30);desktopCapture.stop()}
 
     deinit {
+        backgroundEvents.setActive(false,fps:30)
         desktopCapture.stop()
         for observer in observers {
             NotificationCenter.default.removeObserver(observer)

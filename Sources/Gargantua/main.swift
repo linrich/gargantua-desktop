@@ -19,7 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         do {
             overlay = try OverlayController(settings: settings)
             overlay?.onOpenControls = { [weak self] in self?.showControls() }
-            settings.onChange = { [weak self] in self?.overlay?.apply() }
+            settings.onChange = { [weak self] changes in self?.overlay?.apply(changes) }
             setupStatusItem()
             showControls()
         } catch {
@@ -250,6 +250,32 @@ if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--instance-l
         try runDesktopRefreshChecks(output:output)
         print("背景刷新优化检查通过（仅生成背景）。")
     } catch {
+        FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8));exit(1)
+    }
+} else if CommandLine.arguments.count == 5 && CommandLine.arguments[1] == "--baseline-worker" {
+    do {
+        try runBaselineWorker(mode:CommandLine.arguments[2],name:CommandLine.arguments[3],
+            output:URL(fileURLWithPath:CommandLine.arguments[4],isDirectory:true))
+    } catch {
+        FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8));exit(1)
+    }
+} else if CommandLine.arguments.count == 4 && CommandLine.arguments[1] == "--resource-test" {
+    do { try runResourceOptimizationChecks(mode:CommandLine.arguments[2], output:URL(fileURLWithPath:CommandLine.arguments[3],isDirectory:true)) }
+    catch {
+        FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8));exit(1)
+    }
+} else if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--fft-tuning" {
+    do {try runFFTTuning(output:URL(fileURLWithPath:CommandLine.arguments[2],isDirectory:true))}
+    catch {FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8));exit(1)}
+} else if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--event-test" {
+    do {try runDesktopEventChecks(output:URL(fileURLWithPath:CommandLine.arguments[2],isDirectory:true))}
+    catch {FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8));exit(1)}
+} else if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--sampling-test" {
+    do { try runSamplingOptimizationChecks(output:URL(fileURLWithPath:CommandLine.arguments[2],isDirectory:true)) }
+    catch {FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8));exit(1)}
+} else if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--psf-test" {
+    do { try runPSFOptimizationChecks(directory:URL(fileURLWithPath:CommandLine.arguments[2],isDirectory:true)) }
+    catch {
         FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8));exit(1)
     }
 } else if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--performance-test" {

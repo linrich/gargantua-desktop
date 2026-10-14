@@ -38,19 +38,35 @@ enum RenderError: LocalizedError {
     }
 }
 
+private struct BeamGeometryKey: Equatable {
+    let size: SIMD2<Int>
+    let angle: Float
+    let spin: Float
+    let grid: Int
+}
+private struct PreparedBeams {
+    let key: BeamGeometryKey
+    let primary, secondary, dx, dy: MTLTexture
+    let counter: MTLBuffer
+    let command: MTLCommandBuffer
+}
+
 final class BlackHoleRenderer: NSObject, MTKViewDelegate {
     let device: MTLDevice
+    let resources: RendererResources
     let settings: Settings
     private let queue: MTLCommandQueue
     private let geometryPipeline: MTLComputePipelineState
     private let probePipeline: MTLComputePipelineState
     private let bundleProbePipeline: MTLComputePipelineState
+    private let countBeamsPipeline: MTLComputePipelineState
     private let refinePipeline: MTLComputePipelineState
     private let filterProbePipeline: MTLComputePipelineState
     private let materialPipeline: MTLComputePipelineState
     private let materialProbePipeline: MTLComputePipelineState
     let lens: LensResponse
     private let diskPipeline: MTLRenderPipelineState
+    private let specializedDiskPipeline: MTLRenderPipelineState
     private let compositePipeline: MTLRenderPipelineState
     private let desktopPipeline: MTLRenderPipelineState
     private let desktopGeometryPipeline: MTLComputePipelineState
@@ -81,6 +97,15 @@ final class BlackHoleRenderer: NSObject, MTKViewDelegate {
     private var bundleAtlas: MTLBuffer?
     private var bundleCounter: MTLBuffer?
     private var bundleCapacity: UInt32 = 0
+    // Diagnostic reference keeps the former reserve. Production counts the
+    // exact grids before allocation, without dropping any refined ray.
+    var useDemandBeamAllocation = true
+    private var cachedDemandBeamAllocation = true
+    private var pendingBeams: PreparedBeams?
+    private var readyBeams: PreparedBeams?
+    private(set) var beamAllocationCount = 0
+    private(set) var preparationGPUTimeMS = 0.0
+    private(set) var preparationWaitMS = 0.0
     private var material: MTLTexture?
     private var materialSpin: Float = -2
     private var materialWasReference = false
@@ -101,7 +126,9 @@ final class BlackHoleRenderer: NSObject, MTKViewDelegate {
     // 2 reproduces the previous boundary coverage; 8 is a convergence oracle.
     var edgeGrid = 4
     private(set) var geometryBuildCount = 0
+    private(set) var targetBuildCount = 0
     var useReferenceFiltering = false
+    var useSpecializedDisk = true
     private var animationClock = AnimationClock(wallTime: CACurrentMediaTime())
     private let inFlight = DispatchSemaphore(value: 2)
     private var desktopRefresh = DesktopRefreshState()
@@ -110,62 +137,33 @@ final class BlackHoleRenderer: NSObject, MTKViewDelegate {
         if suspended { desktopRefresh.invalidate() }
     } }
     var onFailure: ((String) -> Void)?
+    var onDesktopInvalidated: (() -> Void)?
 
-    init(settings: Settings, backgroundOnly: Bool = false) throws {
-        self.backgroundOnly=backgroundOnly
-        guard let device = MTLCreateSystemDefaultDevice(),
-              let queue = device.makeCommandQueue() else {
-            throw RenderError.unavailable("这台 Mac 没有可用的 Metal 渲染设备。")
+    init(settings: Settings, backgroundOnly: Bool = false, resources shared: RendererResources? = nil) throws {
+        let resources = try shared ?? RendererResources()
+        self.resources = resources
+        self.device = resources.device
+        self.settings = settings; self.backgroundOnly = backgroundOnly
+        guard let queue = resources.device.makeCommandQueue() else {
+            throw RenderError.unavailable("无法创建 Metal 指令队列。")
         }
-        self.device = device; self.queue = queue; self.settings = settings
-        let shaderURL: URL?
-        #if SWIFT_PACKAGE
-        shaderURL = Bundle.module.url(forResource: "BlackHole", withExtension: "metal", subdirectory: "Shaders")
-        #else
-        shaderURL = Bundle.main.url(forResource: "BlackHole", withExtension: "metal", subdirectory: "Shaders")
-        #endif
-        guard let shaderURL else { throw RenderError.unavailable("缺少 BlackHole.metal 资源，请重新构建 App。") }
-        var source = try String(contentsOf: shaderURL, encoding: .utf8)
-        for name in ["RayBundles.metal", "Lens.metal", "Desktop.metal"] {
-            source += "\n" + (try String(contentsOf: shaderURL.deletingLastPathComponent().appendingPathComponent(name), encoding: .utf8))
-        }
-        let library = try device.makeLibrary(source: source, options: nil)
-        guard let geometry = library.makeFunction(name: "beamGeometry"),
-              let probe = library.makeFunction(name: "probeGeodesics"),
-              let bundleProbe = library.makeFunction(name: "probeBundles"),
-              let refine = library.makeFunction(name: "refineBeams"),
-              let materialBuilder = library.makeFunction(name: "buildDiskMaterial"),
-              let materialProbe = library.makeFunction(name: "probeMaterialEvolution"),
-              let filterProbe = library.makeFunction(name: "probeEWA"),
-              let vertex = library.makeFunction(name: "fullScreenVertex"),
-              let disk = library.makeFunction(name: "bundleDiskFragment"),
-              let composite = library.makeFunction(name: "compositeFragment"),
-              let desktopComposite = library.makeFunction(name:backgroundOnly ? "desktopBackgroundFragment":"desktopCompositeFragment"),
-              let desktopGeometry = library.makeFunction(name:"desktopGeometry"),
-              let desktopMappingProbe = library.makeFunction(name:"probeDesktopMapping"),
-              let desktopLookup = library.makeFunction(name:"probeDesktopLookup") else {
-            throw RenderError.unavailable("Metal shader 入口不完整。")
-        }
-        geometryPipeline = try device.makeComputePipelineState(function: geometry)
-        probePipeline = try device.makeComputePipelineState(function: probe)
-        bundleProbePipeline = try device.makeComputePipelineState(function: bundleProbe)
-        refinePipeline = try device.makeComputePipelineState(function: refine)
-        materialPipeline = try device.makeComputePipelineState(function: materialBuilder)
-        materialProbePipeline = try device.makeComputePipelineState(function: materialProbe)
-        filterProbePipeline = try device.makeComputePipelineState(function: filterProbe)
-        lens = try LensResponse(device: device, library: library)
-        func makePipeline(_ fragment: MTLFunction, format: MTLPixelFormat) throws -> MTLRenderPipelineState {
-            let desc = MTLRenderPipelineDescriptor()
-            desc.vertexFunction = vertex; desc.fragmentFunction = fragment
-            desc.colorAttachments[0].pixelFormat = format
-            return try device.makeRenderPipelineState(descriptor: desc)
-        }
-        diskPipeline = try makePipeline(disk, format: .rgba16Float)
-        compositePipeline = try makePipeline(composite, format: .bgra8Unorm)
-        desktopPipeline = try makePipeline(desktopComposite,format:.bgra8Unorm)
-        desktopGeometryPipeline = try device.makeComputePipelineState(function:desktopGeometry)
-        desktopLookupPipeline = try device.makeComputePipelineState(function:desktopLookup)
-        desktopMappingProbePipeline = try device.makeComputePipelineState(function:desktopMappingProbe)
+        self.queue = queue
+        geometryPipeline = resources.geometryPipeline
+        probePipeline = resources.probePipeline
+        bundleProbePipeline = resources.bundleProbePipeline
+        refinePipeline = resources.refinePipeline
+        countBeamsPipeline = resources.countBeamsPipeline
+        filterProbePipeline = resources.filterProbePipeline
+        materialPipeline = resources.materialPipeline
+        materialProbePipeline = resources.materialProbePipeline
+        desktopGeometryPipeline = resources.desktopGeometryPipeline
+        desktopLookupPipeline = resources.desktopLookupPipeline
+        desktopMappingProbePipeline = resources.desktopMappingProbePipeline
+        diskPipeline = resources.diskPipeline
+        specializedDiskPipeline = resources.specializedDiskPipeline
+        compositePipeline = resources.compositePipeline
+        desktopPipeline = backgroundOnly ? resources.desktopBackgroundPipeline : resources.desktopCompositePipeline
+        lens = LensResponse(device: resources.device, pipelines: resources.lensPipelines)
         super.init()
     }
 
@@ -184,7 +182,18 @@ final class BlackHoleRenderer: NSObject, MTKViewDelegate {
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+        invalidateDesktopSurface()
+    }
+
+    func invalidateDesktopSurface() {
         desktopRefresh.invalidate()
+        if backgroundOnly { onDesktopInvalidated?() }
+    }
+    func desktopSurfaceIsCurrent(in view: MTKView) -> Bool {
+        guard !suspended else { return true }
+        let frame = settings.desktopLensing ? desktopFrameProvider?() : nil
+        let key = desktopRefreshKey(sequence:frame?.sequence,size:SIMD2(Int(view.drawableSize.width),Int(view.drawableSize.height)))
+        return !desktopRefresh.needsDraw(key)
     }
 
     func desktopRefreshKey(sequence: UInt64?, size: SIMD2<Int>) -> DesktopRefreshKey {
@@ -201,10 +210,22 @@ final class BlackHoleRenderer: NSObject, MTKViewDelegate {
         let frame = settings.desktopLensing ? desktopFrameProvider?() : nil
         let key = desktopRefreshKey(sequence: frame?.sequence,
                                     size: SIMD2(Int(view.drawableSize.width), Int(view.drawableSize.height)))
-        // Keep the existing timer and immediate drag transactions, but leave
+        // Retain the last surface between events and immediate drag transactions;
+        // the background view has no periodic timer. Leave
         // the last presented surface intact while its inputs are unchanged.
         // Skip BEFORE acquiring a drawable, semaphore or GPU command buffer.
         if backgroundOnly && !desktopRefresh.needsDraw(key) { return }
+        // Keep the UI thread responsive while exact beam demand is computed.
+        // Until ready, the previous complete drawable remains visible.
+        if !backgroundOnly && useDemandBeamAllocation {
+            let size = liveSceneSize ?? SIMD2(Int(view.drawableSize.width), Int(view.drawableSize.height))
+            do {
+                guard try prepareLiveBeams(size: size, completion: { [weak self, weak view] in
+                    guard let self, let view, !self.suspended, view.isPaused else { return }
+                    view.draw()
+                }) else { return }
+            } catch { onFailure?(error.localizedDescription); return }
+        }
         // A position transaction must not move a panel while silently dropping
         // its replacement pixels. GPU completion releases the gate off-thread.
         let deadline:DispatchTime=view.presentsWithTransaction ? .distantFuture:.now()
@@ -242,6 +263,112 @@ final class BlackHoleRenderer: NSObject, MTKViewDelegate {
         }
     }
 
+    // Main-thread polling, with a completion wake-up for paused views. A stale
+    // request is discarded before adoption; no partial or lower-detail frame is
+    // presented. All writes use fresh textures, safe with two frames in flight.
+    private func prepareLiveBeams(size: SIMD2<Int>, completion: @escaping () -> Void) throws -> Bool {
+        guard size.x > 0, size.y > 0 else { return false }
+        let key = BeamGeometryKey(size:size,angle:Float(settings.inclination),spin:Float(settings.spin),grid:edgeGrid)
+        if cachedSize == size && cachedAngle == key.angle && cachedSpin == key.spin && cachedEdgeGrid == key.grid && cachedDemandBeamAllocation {
+            // Keep ownership of an unfinished request even when the user
+            // returns to cached parameters. Otherwise rapid toggling can queue
+            // unbounded, abandoned geometry work. Drop only completed work.
+            if let pending = pendingBeams, pending.command.status == .completed || pending.command.status == .error {
+                pendingBeams = nil
+            }
+            readyBeams = nil
+            return true
+        }
+        if readyBeams?.key == key { return true }
+        readyBeams = nil
+        if let pending = pendingBeams {
+            if pending.command.status == .error { pendingBeams = nil; try checkedError(pending.command) }
+            else if pending.command.status != .completed { return false }
+            else {
+                pendingBeams = nil
+                if pending.key == key { readyBeams = pending; return true }
+            }
+        }
+        let primary = try texture(size.x,size.y,.rgba32Float)
+        let secondary = try texture(size.x,size.y,.rgba32Float)
+        let dx = try texture(size.x,size.y,.rgba32Float), dy = try texture(size.x,size.y,.rgba32Float)
+        guard let counter = device.makeBuffer(length:16,options:.storageModeShared),
+              let command = diagnosticCommand(), let geometry = command.makeComputeCommandEncoder() else {
+            throw RenderError.unavailable("无法异步准备光束缓存。")
+        }
+        var u = Uniforms(resolution:SIMD2(Float(size.x),Float(size.y)),time:0,exposure:1,
+                         inclination:key.angle,glow:0,spin:key.spin,relativistic:0,edgeGrid:Float(key.grid))
+        geometry.setComputePipelineState(geometryPipeline)
+        for (i,t) in [primary,secondary,dx,dy].enumerated() { geometry.setTexture(t,index:i) }
+        geometry.setBytes(&u,length:MemoryLayout<Uniforms>.stride,index:0)
+        geometry.dispatchThreads(MTLSize(width:size.x,height:size.y,depth:1),threadsPerThreadgroup:MTLSize(width:8,height:8,depth:1))
+        geometry.endEncoding()
+        guard let clear = command.makeBlitCommandEncoder() else { throw RenderError.unavailable("无法清空光束需求。") }
+        clear.fill(buffer:counter,range:0..<16,value:0); clear.endEncoding()
+        guard let count = command.makeComputeCommandEncoder() else { throw RenderError.unavailable("无法统计光束需求。") }
+        count.setComputePipelineState(countBeamsPipeline)
+        for (i,t) in [secondary,dx,dy].enumerated() { count.setTexture(t,index:i) }
+        count.setBuffer(counter,offset:0,index:0); count.setBytes(&u,length:MemoryLayout<Uniforms>.stride,index:1)
+        count.dispatchThreads(MTLSize(width:size.x,height:size.y,depth:1),threadsPerThreadgroup:MTLSize(width:8,height:8,depth:1))
+        count.endEncoding()
+        pendingBeams = PreparedBeams(key:key,primary:primary,secondary:secondary,dx:dx,dy:dy,counter:counter,command:command)
+        command.addCompletedHandler { _ in DispatchQueue.main.async(execute:completion) }
+        command.commit()
+        return false
+    }
+
+    func checkAsyncBeamPreparation(output: URL) throws -> [String:Bool] {
+        var checks = [String:Bool]()
+        let size = SIMD2(720,450)
+        checks["live_initial_preparation_yields"] = try !prepareLiveBeams(size:size,completion:{})
+        guard let first = pendingBeams else { throw RenderError.unavailable("异步光束测试未启动。") }
+        // Waiting occurs only in this diagnostic, never in draw(in:).
+        first.command.waitUntilCompleted(); try checkedError(first.command)
+        settings.spin = 0.6
+        checks["stale_geometry_not_adopted"] = try !prepareLiveBeams(size:size,completion:{}) && readyBeams == nil
+        guard let second = pendingBeams else { throw RenderError.unavailable("异步光束测试未重启。") }
+        second.command.waitUntilCompleted(); try checkedError(second.command)
+        checks["current_geometry_adopted"] = try prepareLiveBeams(size:size,completion:{})
+        checks["ready_geometry_survives_skipped_draw"] = try prepareLiveBeams(size:size,completion:{}) && pendingBeams == nil
+        let prepared = try snapshot(to:output.appendingPathComponent("async-prepared.png"),width:size.x,height:size.y)
+        checks["adoption_does_not_wait_again"] = preparationWaitMS == 0
+        let reference = try BlackHoleRenderer(settings:settings,resources:resources)
+        reference.useDemandBeamAllocation = false
+        let expected = try reference.snapshot(to:output.appendingPathComponent("async-reference.png"),width:size.x,height:size.y)
+        checks["async_preparation_exact_image"] = prepared == expected
+        checks["live_warm_preparation_reuses_cache"] = try prepareLiveBeams(size:size,completion:{}) && pendingBeams == nil
+        let (inFlight,_) = try submitBaseline(width:size.x,height:size.y,time:12)
+        settings.spin = -0.6
+        checks["preparation_with_previous_frame_in_flight_yields"] = try !prepareLiveBeams(size:size,completion:{})
+        guard let third = pendingBeams else { throw RenderError.unavailable("异步重建测试未启动。") }
+        third.command.waitUntilCompleted(); try checkedError(third.command)
+        inFlight.waitUntilCompleted(); try checkedError(inFlight)
+        checks["in_flight_rebuild_adopted"] = try prepareLiveBeams(size:size,completion:{})
+        let after = try snapshot(to:output.appendingPathComponent("async-rebuild.png"),width:size.x,height:size.y)
+        let target = try reference.snapshot(to:output.appendingPathComponent("async-rebuild-reference.png"),width:size.x,height:size.y)
+        checks["in_flight_rebuild_exact_image"] = after == target
+        settings.spin = 0.8
+        _ = try prepareLiveBeams(size:size,completion:{})
+        guard let outstanding = pendingBeams else { throw RenderError.unavailable("快速参数切换测试未启动。") }
+        settings.spin = -0.6
+        checks["return_to_cached_geometry_is_immediate"] = try prepareLiveBeams(size:size,completion:{})
+        checks["unfinished_request_retained_on_cache_return"] = outstanding.command.status == .completed || pendingBeams?.command === outstanding.command
+        settings.spin = 0.2
+        _ = try prepareLiveBeams(size:size,completion:{})
+        checks["rapid_toggle_keeps_only_one_unfinished_request"] = outstanding.command.status == .completed || pendingBeams?.command === outstanding.command
+        pendingBeams?.command.waitUntilCompleted()
+        // If the first request completed during the toggle, this may already
+        // adopt the replacement; otherwise it starts it after discarding stale work.
+        if try !prepareLiveBeams(size:size,completion:{}) {
+            pendingBeams?.command.waitUntilCompleted()
+            _ = try prepareLiveBeams(size:size,completion:{})
+        }
+        let toggled = try snapshot(to:output.appendingPathComponent("async-toggle.png"),width:size.x,height:size.y)
+        let toggleReference = try reference.snapshot(to:output.appendingPathComponent("async-toggle-reference.png"),width:size.x,height:size.y)
+        checks["rapid_toggle_final_image_exact"] = toggled == toggleReference
+        return checks
+    }
+
     private func texture(_ width: Int, _ height: Int, _ format: MTLPixelFormat) throws -> MTLTexture {
         let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: width, height: height, mipmapped: false)
         desc.usage = [.shaderRead, .shaderWrite, .renderTarget]
@@ -252,43 +379,51 @@ final class BlackHoleRenderer: NSObject, MTKViewDelegate {
         return value
     }
 
-    private func pass(_ target: MTLTexture) -> MTLRenderPassDescriptor {
+    private func pass(_ target: MTLTexture, profile: FrameProfile? = nil, stage: String = "") -> MTLRenderPassDescriptor {
         let desc = MTLRenderPassDescriptor()
         desc.colorAttachments[0].texture = target
         desc.colorAttachments[0].loadAction = .clear
         desc.colorAttachments[0].storeAction = .store
         desc.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0)
+        profile?.render(desc, stage: stage)
         return desc
     }
 
-    private func encode(command: MTLCommandBuffer, target: MTLTexture, time: Float, background: Float = 0, frame: DesktopFrame? = nil, sceneSize: SIMD2<Int>? = nil) throws {
+    private func encode(command: MTLCommandBuffer, target: MTLTexture, time: Float, background: Float = 0, frame: DesktopFrame? = nil, sceneSize: SIMD2<Int>? = nil, profile: FrameProfile? = nil) throws {
+        preparationGPUTimeMS = 0; preparationWaitMS = 0
         if backgroundOnly {
-            try encodeBackground(command:command,target:target,background:background,frame:frame)
+            try encodeBackground(command:command,target:target,background:background,frame:frame,profile:profile)
             return
         }
         let width = sceneSize?.x ?? target.width, height = sceneSize?.y ?? target.height
         let size = SIMD2<Int>(width, height)
         let angle = Float(settings.inclination)
         let spin = Float(settings.spin)
-        let rebuild = cachedSize != size || cachedAngle != angle || cachedSpin != spin || cachedEdgeGrid != edgeGrid
+        let rebuild = cachedSize != size || cachedAngle != angle || cachedSpin != spin || cachedEdgeGrid != edgeGrid || cachedDemandBeamAllocation != useDemandBeamAllocation
+        let key = BeamGeometryKey(size:size,angle:angle,spin:spin,grid:edgeGrid)
+        let prepared = useDemandBeamAllocation && readyBeams?.key == key ? readyBeams : nil
+        readyBeams = nil
+        if let prepared {
+            primary = prepared.primary; secondary = prepared.secondary
+            differentialX = prepared.dx; differentialY = prepared.dy; bundleCounter = prepared.counter
+        }
+        profile?.beginCPU("target_allocation")
         if cachedSize != size || cachedEdgeGrid != edgeGrid {
-            primary = try texture(width, height, .rgba32Float)
-            secondary = try texture(width, height, .rgba32Float)
-            differentialX = try texture(width, height, .rgba32Float)
-            differentialY = try texture(width, height, .rgba32Float)
+            if prepared == nil {
+                primary = try texture(width, height, .rgba32Float)
+                secondary = try texture(width, height, .rgba32Float)
+                differentialX = try texture(width, height, .rgba32Float)
+                differentialY = try texture(width, height, .rgba32Float)
+                bundleCounter = device.makeBuffer(length: 16, options: .storageModeShared)
+            }
             bundleIndices = try texture(width, height, .r32Uint)
-            // Flat sparse beam storage: four bundles in smooth/large-footprint
-            // regions, sixteen at visibility/image-branch edges. Extra reserve
-            // prevents a dense small image from competing with boundary samples.
-            bundleCapacity = UInt32(max(4096,width*height + 524288))
-            if edgeGrid > 4 {bundleCapacity = UInt32(width*height*edgeGrid*edgeGrid)}
-            bundleAtlas = device.makeBuffer(length: Int(bundleCapacity)*64, options: .storageModePrivate)
-            bundleCounter = device.makeBuffer(length: 16, options: .storageModeShared)
             scene = try texture(width, height, .rgba16Float)
             optical = try texture(width, height, .rgba16Float)
+            targetBuildCount += 1
         }
+        profile?.endCPU("target_allocation")
         guard let primary, let secondary, let differentialX, let differentialY, let bundleIndices,
-              let bundleAtlas, let bundleCounter, let scene, let optical else {
+              let bundleCounter, let scene, let optical else {
             throw RenderError.unavailable("渲染目标未就绪。")
         }
         var u = Uniforms(resolution: SIMD2(Float(width), Float(height)), time: time,
@@ -300,22 +435,61 @@ final class BlackHoleRenderer: NSObject, MTKViewDelegate {
                          colorRotation: SIMD2(Float(cos(settings.diskHue * .pi/180)*settings.diskSaturation),
                                               Float(sin(settings.diskHue * .pi/180)*settings.diskSaturation)),
                          edgeGrid:Float(edgeGrid),materialEvolution:useReferenceMaterial ? 0 : (shadowCoverageDiagnostic ? 2 : 1))
+        profile?.beginCPU("geometry")
         if rebuild {
             geometryBuildCount += 1
-            guard let compute = command.makeComputeCommandEncoder() else {
-                throw RenderError.unavailable("无法创建光线计算指令。")
+            if prepared != nil {
+                let demand = Int(bundleCounter.contents().advanced(by:12).load(as:UInt32.self))
+                try allocateBeams(capacity:max(4096,((demand+4095)/4096)*4096))
+            } else {
+                // Only a geometry cache miss needs a CPU/GPU rendezvous. An exact
+                // count avoids the old large speculative atlas. This queue also
+                // orders the prefix after any prior frame still reading the cache.
+                guard let geometryCommand = useDemandBeamAllocation ? diagnosticCommand() : command,
+                      let compute = profiledCompute(geometryCommand, profile, "geometry") else {
+                    throw RenderError.unavailable("无法创建光线计算指令。")
+                }
+                compute.label = "Cache gravitational light paths"
+                compute.setComputePipelineState(geometryPipeline)
+                compute.setTexture(primary, index: 0); compute.setTexture(secondary, index: 1)
+                compute.setTexture(differentialX, index: 2); compute.setTexture(differentialY, index: 3)
+                compute.setBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
+                compute.dispatchThreads(MTLSize(width: width, height: height, depth: 1),
+                                        threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
+                compute.endEncoding()
+                profile?.endCPU("geometry")
+                if useDemandBeamAllocation {
+                    profile?.beginCPU("beam_demand")
+                    guard let clear = profiledBlit(geometryCommand, profile, "beam_demand", "clear_demand"),
+                          bundleCounter.length >= 16 else { throw RenderError.unavailable("无法清空光束计数。") }
+                    clear.fill(buffer: bundleCounter, range: 0..<16, value: 0); clear.endEncoding()
+                    guard let count = profiledCompute(geometryCommand, profile, "beam_demand") else {
+                        throw RenderError.unavailable("无法统计光束需求。")
+                    }
+                    count.setComputePipelineState(countBeamsPipeline)
+                    for (i,t) in [secondary,differentialX,differentialY].enumerated() { count.setTexture(t,index:i) }
+                    count.setBuffer(bundleCounter,offset:0,index:0)
+                    count.setBytes(&u,length:MemoryLayout<Uniforms>.stride,index:1)
+                    count.dispatchThreads(MTLSize(width:width,height:height,depth:1),threadsPerThreadgroup:MTLSize(width:8,height:8,depth:1))
+                    count.endEncoding()
+                    let waitStart = CACurrentMediaTime()
+                    geometryCommand.commit(); geometryCommand.waitUntilCompleted()
+                    preparationWaitMS = (CACurrentMediaTime()-waitStart)*1000
+                    try checkedError(geometryCommand)
+                    preparationGPUTimeMS = (geometryCommand.gpuEndTime-geometryCommand.gpuStartTime)*1000
+                    let demand = Int(bundleCounter.contents().advanced(by:12).load(as:UInt32.self))
+                    try allocateBeams(capacity: max(4096, ((demand+4095)/4096)*4096))
+                    profile?.endCPU("beam_demand")
+                } else {
+                    let capacity = edgeGrid > 4 ? width*height*edgeGrid*edgeGrid : max(4096,width*height+524288)
+                    try allocateBeams(capacity: capacity)
+                }
             }
-            compute.label = "Cache gravitational light paths"
-            compute.setComputePipelineState(geometryPipeline)
-            compute.setTexture(primary, index: 0); compute.setTexture(secondary, index: 1)
-            compute.setTexture(differentialX, index: 2); compute.setTexture(differentialY, index: 3)
-            compute.setBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
-            compute.dispatchThreads(MTLSize(width: width, height: height, depth: 1),
-                                    threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
-            compute.endEncoding()
-            guard let clear = command.makeBlitCommandEncoder() else { throw RenderError.unavailable("无法清空光束索引。") }
+            guard let bundleAtlas else { throw RenderError.unavailable("光束缓存未就绪。") }
+            profile?.beginCPU("beam_refinement")
+            guard let clear = profiledBlit(command, profile, "beam_refinement", "clear_counter") else { throw RenderError.unavailable("无法清空光束索引。") }
             clear.fill(buffer: bundleCounter, range: 0..<16, value: 0); clear.endEncoding()
-            guard let refine = command.makeComputeCommandEncoder() else { throw RenderError.unavailable("无法细分光束。") }
+            guard let refine = profiledCompute(command, profile, "beam_refinement") else { throw RenderError.unavailable("无法细分光束。") }
             refine.setComputePipelineState(refinePipeline)
             for (i,t) in [primary,secondary,differentialX,differentialY,bundleIndices].enumerated() { refine.setTexture(t,index:i) }
             refine.setBuffer(bundleAtlas,offset:0,index:0); refine.setBuffer(bundleCounter,offset:0,index:1)
@@ -323,11 +497,14 @@ final class BlackHoleRenderer: NSObject, MTKViewDelegate {
             refine.dispatchThreads(MTLSize(width:width,height:height,depth:1),threadsPerThreadgroup:MTLSize(width:8,height:8,depth:1))
             refine.endEncoding()
         }
+        profile?.endCPU("geometry")
+        profile?.endCPU("beam_refinement")
+        profile?.beginCPU("material")
         let materialWidth = useLegacyDetail ? 2048 : RenderDetail.materialWidth(for:width)
         if material?.width != materialWidth || materialSpin != spin || materialWasReference != useReferenceMaterial || materialWasLegacyDetail != useLegacyDetail {
             let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: materialWidth, height: materialWidth/2, mipmapped: true)
             descriptor.usage = [.shaderRead,.shaderWrite]; descriptor.storageMode = .private
-            guard let tex = device.makeTexture(descriptor: descriptor), let compute = command.makeComputeCommandEncoder() else {
+            guard let tex = device.makeTexture(descriptor: descriptor), let compute = profiledCompute(command, profile, "material") else {
                 throw RenderError.unavailable("无法创建吸积盘滤波纹理。")
             }
             material = tex
@@ -336,16 +513,21 @@ final class BlackHoleRenderer: NSObject, MTKViewDelegate {
             compute.setBytes(&options,length:MemoryLayout<SIMD4<Float>>.stride,index:0)
             compute.dispatchThreads(MTLSize(width:tex.width,height:tex.height,depth:1),threadsPerThreadgroup:MTLSize(width:16,height:8,depth:1))
             compute.endEncoding()
-            guard let blit = command.makeBlitCommandEncoder() else {throw RenderError.unavailable("无法生成线性光强 mipmap。")}
+            guard let blit = profiledBlit(command, profile, "material_mipmaps") else {throw RenderError.unavailable("无法生成线性光强 mipmap。")}
             blit.generateMipmaps(for:tex); blit.endEncoding(); materialSpin = spin
             materialWasReference = useReferenceMaterial; materialBuildCount += 1
             materialWasLegacyDetail = useLegacyDetail
         }
-        guard let disk = command.makeRenderCommandEncoder(descriptor: pass(scene)) else {
+        profile?.endCPU("material")
+        profile?.beginCPU("disk")
+        guard let disk = command.makeRenderCommandEncoder(descriptor: pass(scene, profile: profile, stage: "disk")) else {
             throw RenderError.unavailable("无法创建吸积盘渲染指令。")
         }
         disk.label = "Animated accretion disk"
-        disk.setRenderPipelineState(diskPipeline)
+        // The common EWA mode has fixed enabled/reference switches; other
+        // material, shutter and colour options remain runtime uniforms.
+        let fixedSampling=useSpecializedDisk && u.beams==1
+        disk.setRenderPipelineState(fixedSampling ? specializedDiskPipeline:diskPipeline)
         disk.setFragmentTexture(primary, index: 0); disk.setFragmentTexture(secondary, index: 1)
         disk.setFragmentTexture(differentialX, index: 2); disk.setFragmentTexture(differentialY, index: 3)
         disk.setFragmentTexture(bundleIndices, index: 4); disk.setFragmentTexture(material, index: 5)
@@ -353,11 +535,12 @@ final class BlackHoleRenderer: NSObject, MTKViewDelegate {
         disk.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
         disk.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         disk.endEncoding()
+        profile?.endCPU("disk")
 
         lens.useReferenceCore = useLegacyDetail
         if settings.lensResponse {
             try lens.apply(command: command, scene: scene, target: optical, glow: settings.glow,
-                           scale: settings.lensScale, measured: settings.measuredPSF, revision: settings.psfRevision)
+                           scale: settings.lensScale, measured: settings.measuredPSF, revision: settings.psfRevision, profile: profile)
         }
         // Capture surfaces must outlive the asynchronous GPU command. Never
         // retain a live frame in the geometry or material caches.
@@ -365,9 +548,10 @@ final class BlackHoleRenderer: NSObject, MTKViewDelegate {
         var compositeUniforms=u
         compositeUniforms.resolution=SIMD2(Float(target.width),Float(target.height))
         if let frame {command.addCompletedHandler {_ in withExtendedLifetime(frame) {}}}
-        if desktop != nil {try prepareDesktopMap(command:command,u:&compositeUniforms)}
+        if desktop != nil {try prepareDesktopMap(command:command,u:&compositeUniforms,profile:profile)}
         else {desktopMap=nil;desktopMapSize=SIMD2(0,0)}
-        guard let composite = command.makeRenderCommandEncoder(descriptor: pass(target)) else {
+        profile?.beginCPU("composite")
+        guard let composite = command.makeRenderCommandEncoder(descriptor: pass(target, profile: profile, stage: "composite")) else {
             throw RenderError.unavailable("无法创建透明合成指令。")
         }
         composite.label = "Bloom and premultiplied desktop compositing"
@@ -381,7 +565,17 @@ final class BlackHoleRenderer: NSObject, MTKViewDelegate {
         }
         composite.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         composite.endEncoding()
-        cachedSize = size; cachedAngle = angle; cachedSpin = spin; cachedEdgeGrid = edgeGrid
+        profile?.endCPU("composite")
+        cachedSize = size; cachedAngle = angle; cachedSpin = spin; cachedEdgeGrid = edgeGrid; cachedDemandBeamAllocation = useDemandBeamAllocation
+    }
+
+    private func allocateBeams(capacity: Int) throws {
+        guard capacity > 0, capacity < 0x40000000 else { throw RenderError.unavailable("光束需求超过索引范围。") }
+        guard bundleAtlas == nil || Int(bundleCapacity) != capacity else { return }
+        guard let atlas = device.makeBuffer(length: capacity*64, options: .storageModePrivate) else {
+            throw RenderError.unavailable("无法分配完整光束缓存。")
+        }
+        bundleAtlas = atlas; bundleCapacity = UInt32(capacity); beamAllocationCount += 1
     }
 
     private func desktopUniforms() -> DesktopUniforms {
@@ -390,7 +584,9 @@ final class BlackHoleRenderer: NSObject, MTKViewDelegate {
                         viewport:desktopViewport)
     }
 
-    private func prepareDesktopMap(command: MTLCommandBuffer, u: inout Uniforms) throws {
+    private func prepareDesktopMap(command: MTLCommandBuffer, u: inout Uniforms, profile: FrameProfile? = nil) throws {
+        profile?.beginCPU("desktop_map")
+        defer { profile?.endCPU("desktop_map") }
         desktopOutputSize=SIMD2(Int(u.resolution.x),Int(u.resolution.y))
         let side=DesktopField.mapSide(output:desktopOutputSize,viewport:desktopViewport)
         let extent=DesktopField.extent(output:desktopOutputSize,viewport:desktopViewport)
@@ -399,7 +595,7 @@ final class BlackHoleRenderer: NSObject, MTKViewDelegate {
         if desktopMapSize != size {desktopMap=try texture(side,side,.rgba32Float)}
         desktopMapExtent=extent
         var d=desktopUniforms()
-        guard let map=desktopMap,let compute=command.makeComputeCommandEncoder() else {
+        guard let map=desktopMap,let compute=profiledCompute(command, profile, "desktop_map") else {
             throw RenderError.unavailable("无法创建桌面透镜映射。")
         }
         compute.setComputePipelineState(desktopGeometryPipeline);compute.setTexture(map,index:0)
@@ -413,13 +609,15 @@ final class BlackHoleRenderer: NSObject, MTKViewDelegate {
     // Stationary, mouse-transparent surface; only the local scissor is shaded.
     // No disk/PSF allocation
     // or animation work is done here; the original foreground view is unchanged.
-    private func encodeBackground(command: MTLCommandBuffer, target: MTLTexture, background: Float, frame: DesktopFrame?) throws {
+    private func encodeBackground(command: MTLCommandBuffer, target: MTLTexture, background: Float, frame: DesktopFrame?, profile: FrameProfile? = nil) throws {
         let desktop=settings.desktopLensing ? (syntheticDesktop ?? frame?.texture):nil
         if let frame {command.addCompletedHandler {_ in withExtendedLifetime(frame) {}}}
         var u=Uniforms(resolution:SIMD2(Float(target.width),Float(target.height)),time:0,exposure:1,
                        inclination:Float(settings.inclination),glow:0,background:background,spin:Float(settings.spin),relativistic:0)
-        if desktop != nil {try prepareDesktopMap(command:command,u:&u)}
-        guard let composite=command.makeRenderCommandEncoder(descriptor:pass(target)) else {
+        if desktop != nil {try prepareDesktopMap(command:command,u:&u,profile:profile)}
+        profile?.beginCPU("desktop_composite")
+        defer { profile?.endCPU("desktop_composite") }
+        guard let composite=command.makeRenderCommandEncoder(descriptor:pass(target, profile: profile, stage: "desktop_composite")) else {
             throw RenderError.unavailable("无法创建桌面背景合成。")
         }
         if let desktop,let desktopMap {
@@ -752,6 +950,51 @@ final class BlackHoleRenderer: NSObject, MTKViewDelegate {
         return ["baseline":stats(before),"optimized":stats(after)]
     }
 
+    var baselineBuildCounts: [String: Int] {
+        ["geometry": geometryBuildCount, "material": materialBuildCount,
+         "foreground_targets": targetBuildCount, "desktop_map": desktopMapBuildCount,
+         "psf_kernel": lens.kernelBuildCount, "fft_targets": lens.allocationCount]
+    }
+
+    // Resource allocation sizes reported by Metal, not a process footprint.
+    // Read only after completion when inspecting the shared beam counters.
+    var baselineResources: [String: Any] {
+        func total(_ textures: [MTLTexture?]) -> Int {
+            textures.compactMap { $0 }.reduce(0) { $0 + $1.allocatedSize }
+        }
+        let bytes = ["geometry_and_indices": total([primary,secondary,differentialX,differentialY,bundleIndices]),
+                     "beam_atlas": bundleAtlas?.allocatedSize ?? 0,
+                     "beam_counter": bundleCounter?.allocatedSize ?? 0,
+                     "material": total([material]), "scene_and_optical": total([scene,optical]),
+                     "psf_fft": lens.allocatedBytes, "desktop_map": total([desktopMap]),
+                     "offscreen_output": total([validationTarget]), "generated_background": total([syntheticDesktop])]
+        let counters = bundleCounter?.contents().bindMemory(to: UInt32.self, capacity: 4)
+        return ["allocated_bytes_by_resource": bytes, "resource_sum_bytes": bytes.values.reduce(0,+),
+                "device_current_allocated_bytes": device.currentAllocatedSize,
+                "beam_allocations": beamAllocationCount, "demand_allocation": useDemandBeamAllocation,
+                "subbeam_capacity": Int(bundleCapacity), "subbeams_used": Int(counters?[3] ?? 0),
+                "subbeam_overflows": Int(counters?[1] ?? 0), "material_resolution": materialResolution,
+                "fft_resolution": [lens.paddingWidth,lens.paddingHeight], "psf_kernel_size": lens.kernelSize]
+    }
+
+    // Diagnostic-only submission using exactly the production encode path.
+    // Caller owns completion; the memory test can keep two commands in flight.
+    func submitBaseline(width: Int, height: Int, time: Float, profile: FrameProfile? = nil) throws -> (MTLCommandBuffer, Double) {
+        let start = CACurrentMediaTime()
+        profile?.beginCPU("output_target")
+        if validationTarget?.width != width || validationTarget?.height != height {
+            validationTarget = try texture(width,height,.bgra8Unorm)
+        }
+        profile?.endCPU("output_target")
+        guard let target = validationTarget, let command = diagnosticCommand() else {
+            throw RenderError.unavailable("无法创建性能基线目标。")
+        }
+        try encode(command:command,target:target,time:time,profile:profile)
+        let milliseconds = (CACurrentMediaTime()-start)*1000
+        command.commit()
+        return (command,milliseconds)
+    }
+
     func benchmark(width: Int, height: Int, frames: Int = 24, lensOnly: Bool = false) throws -> [String: Any] {
         let target = try texture(width,height,.bgra8Unorm)
         var gpu = [Double](), wall = [Double]()
@@ -782,7 +1025,7 @@ final class BlackHoleRenderer: NSObject, MTKViewDelegate {
 
     // Deterministic, offscreen GPU rendering for verification, no desktop capture.
     func snapshot(to url: URL, width: Int = 1280, height: Int = 800,
-                  time: Float = 12, background: Float = 0, sceneSize: SIMD2<Int>? = nil, reuseTarget: Bool = false) throws -> [UInt8] {
+                  time: Float = 12, background: Float = 0, sceneSize: SIMD2<Int>? = nil, reuseTarget: Bool = false, profile: FrameProfile? = nil) throws -> [UInt8] {
         let target: MTLTexture
         if reuseTarget,let previous=validationTarget,previous.width==width,previous.height==height {target=previous}
         else {target=try texture(width,height,.bgra8Unorm)}
@@ -792,7 +1035,7 @@ final class BlackHoleRenderer: NSObject, MTKViewDelegate {
               let command = diagnosticCommand() else {
             throw RenderError.unavailable("无法创建离屏渲染缓冲区。")
         }
-        try encode(command: command, target: target, time: time, background: background,sceneSize:sceneSize)
+        try encode(command: command, target: target, time: time, background: background,sceneSize:sceneSize,profile:profile)
         guard let blit = command.makeBlitCommandEncoder() else {
             throw RenderError.unavailable("无法读取离屏渲染结果。")
         }

@@ -41,22 +41,37 @@ struct FFTParameters {
 
 final class LensResponse {
     private let device: MTLDevice
-    private var pipelines: [String: MTLComputePipelineState] = [:]
+    private let pipelines: [String: MTLComputePipelineState]
     private var a: MTLTexture?, b: MTLTexture?, spectrum: MTLTexture?
+    // Keep the previous schedule for exact same-binary comparisons.
+    var useGroupedColumns = true
     private var cachedKey = ""
     // Kept for numerical/performance regression checks against the v0.3 path.
     var useReferenceFFT = false
     var useReferenceCore = false
     // Exact v0.9.3 pass schedule retained for same-binary regression checks.
     var useFusedPasses = true
+    // Retain the measured baseline for same-binary, exact-image comparisons.
+    // A larger local FFT tile avoids full-texture intermediate traffic.
+    var useCompactPSF = true
+    private var compactPSF: Bool { useCompactPSF && useFusedPasses && !useReferenceFFT }
     private(set) var kernel: [Float] = []
     private(set) var kernelSize = 0
     private(set) var paddingWidth = 0
     private(set) var paddingHeight = 0
+    private(set) var kernelBuildCount = 0
+    private(set) var allocationCount = 0
+    var allocatedBytes: Int { [a, b, spectrum].compactMap { $0 }.reduce(0) { $0 + $1.allocatedSize } }
 
-    init(device: MTLDevice, library: MTLLibrary) throws {
-        self.device = device
-        for name in ["fftLoadScene","fftLoadKernel","fftReorder","fftStage","fftBlock","fftStagePair","fftMultiply","fftFinish","fftStagePairFinish"] {
+    init(device: MTLDevice, pipelines: [String: MTLComputePipelineState]) {
+        self.device = device; self.pipelines = pipelines
+    }
+    convenience init(device: MTLDevice, library: MTLLibrary) throws {
+        self.init(device: device, pipelines: try Self.makePipelines(device: device, library: library))
+    }
+    static func makePipelines(device: MTLDevice, library: MTLLibrary) throws -> [String: MTLComputePipelineState] {
+        var pipelines = [String: MTLComputePipelineState]()
+        for name in ["fftLoadScene","fftLoadKernel","fftReorder","fftStage","fftBlock","fftStagePair","fftMultiply","fftFinish","fftStagePairFinish","fftStoreSpectrum"] {
             guard let f = library.makeFunction(name: name) else { throw RenderError.unavailable("缺少镜头卷积入口。") }
             pipelines[name] = try device.makeComputePipelineState(function: f)
         }
@@ -72,17 +87,26 @@ final class LensResponse {
                 pipelines[name + (simd ? "SIMD":"")] = try device.makeComputePipelineState(function: function)
             }
         }
+        if device.supportsFamily(.apple1) {
+            for columns:UInt32 in [4] {
+                let constants=MTLFunctionConstantValues();var value=columns
+                constants.setConstantValue(&value,type:.uint,index:2)
+                let function=try library.makeFunction(name:"fftBlockColumns",constantValues:constants)
+                pipelines["fftBlockColumns\(columns)"]=try device.makeComputePipelineState(function:function)
+            }
+        }
+        return pipelines
     }
-    private func texture(_ width: Int, _ height: Int) throws -> MTLTexture {
-        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Float, width: width, height: height, mipmapped: false)
+    private func texture(_ width: Int, _ height: Int, format: MTLPixelFormat = .rgba32Float) throws -> MTLTexture {
+        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: width, height: height, mipmapped: false)
         d.usage = [.shaderRead,.shaderWrite]; d.storageMode = .private
         guard let t = device.makeTexture(descriptor: d) else { throw RenderError.unavailable("镜头卷积内存不足，请降低尺寸。") }
         return t
     }
     private func encode(_ name: String, command: MTLCommandBuffer, textures: [(Int,MTLTexture)],
                         params: FFTParameters? = nil, paramIndex: Int = 0, buffer: MTLBuffer? = nil,
-                        width: Int, height: Int) throws {
-        guard let e = command.makeComputeCommandEncoder(), let pipeline = pipelines[name] else {
+                        width: Int, height: Int, profile: FrameProfile? = nil, stage: String = "psf_convolution") throws {
+        guard let e = profiledCompute(command, profile, stage, name), let pipeline = pipelines[name] else {
             throw RenderError.unavailable("无法创建镜头卷积指令。")
         }
         e.label = name; e.setComputePipelineState(pipeline)
@@ -94,7 +118,8 @@ final class LensResponse {
     }
     private func fft(command: MTLCommandBuffer, source: inout MTLTexture, scratch: inout MTLTexture, inverse: Bool,
                      sceneInput: MTLTexture? = nil, multiply: MTLTexture? = nil,
-                     finish: (scene: MTLTexture, target: MTLTexture)? = nil) throws {
+                     finish: (scene: MTLTexture, target: MTLTexture)? = nil,
+                     profile: FrameProfile? = nil, stage: String = "psf_convolution") throws {
         var p = FFTParameters(source.width,source.height); p.inverse = inverse ? 1:0
         // Register shuffles help larger Apple-GPU transforms; on the measured
         // small transform their overhead exceeds the barrier savings. Retain
@@ -102,29 +127,51 @@ final class LensResponse {
         let simd = useFusedPasses && device.supportsFamily(.apple1) && source.width * source.height >= 1_048_576
         let suffix = simd ? "SIMD":""
         let regularBlock = simd ? "fftBlockRegistersSIMD":"fftBlock"
+        // Keep one extra radix-2 stage in the existing Float32 threadgroup
+        // tile. Its barriers preserve the old intermediate rounding points.
+        // Respect both the selected pipeline's thread limit and device memory.
+        let preferredBlock = compactPSF ? 2048:1024
         for axis in 0...1 {
             let n = axis == 0 ? source.width:source.height
             p.axis = UInt32(axis); p.bits = UInt32(n.trailingZeroBitCount)
             var span = 2
-            if useReferenceFFT {
-                try encode("fftReorder",command:command,textures:[(0,source),(1,scratch)],params:p,width:source.width,height:source.height)
+            // Large column transforms batch four adjacent columns to improve
+            // read/write locality. Keep a 32 KiB tile and the original rounded
+            // butterflies; unsupported devices use the established path.
+            if axis==1 && simd && compactPSF && n>2048 && useGroupedColumns && source.width%4==0,
+               let pipeline=pipelines["fftBlockColumns4"], pipeline.maxTotalThreadsPerThreadgroup>=1024,
+               device.maxThreadgroupMemoryLength>=32768 {
+                let columns=4,block=512
+                guard let e=profiledCompute(command,profile,stage,"fftBlockColumns\(columns)") else {throw RenderError.unavailable("FFT 列分组失败。")}
+                p.span=UInt32(block)
+                e.setComputePipelineState(pipeline);e.setTexture(source,index:0);e.setTexture(scratch,index:1)
+                e.setBytes(&p,length:MemoryLayout<FFTParameters>.stride,index:0)
+                e.setThreadgroupMemoryLength(block*columns*16,index:0)
+                e.dispatchThreadgroups(MTLSize(width:n/block,height:source.width/columns,depth:1),threadsPerThreadgroup:MTLSize(width:block*columns/2,height:1,depth:1))
+                e.endEncoding();span=block*2
+            } else if useReferenceFFT {
+                try encode("fftReorder",command:command,textures:[(0,source),(1,scratch)],params:p,width:source.width,height:source.height,profile:profile,stage:stage)
             } else {
                 var name = regularBlock
                 if axis == 0, sceneInput != nil { name = "fftBlockScene" + suffix }
                 if axis == 0, multiply != nil { name = "fftBlockMultiply" + suffix }
                 // Select the terminal block only when all stages fit locally.
-                if axis == 1, finish != nil, n <= 1024 { name = "fftBlockFinish" + suffix }
-                guard let e = command.makeComputeCommandEncoder(), var pipeline = pipelines[name] else {
+                if axis == 1, finish != nil, n <= preferredBlock { name = "fftBlockFinish" + suffix }
+                guard var pipeline = pipelines[name] else {
                     throw RenderError.unavailable("无法创建分块 FFT 指令。")
                 }
-                var block = min(1024,n)
+                var block = min(preferredBlock,n)
                 while block/2 > pipeline.maxTotalThreadsPerThreadgroup || block*16 > device.maxThreadgroupMemoryLength {block/=2}
                 if name == "fftBlockFinish" + suffix, block < n {
                     // Smaller devices finish in the last global butterfly pass.
                     pipeline = pipelines[regularBlock]!
+                    name = regularBlock
                     while block/2 > pipeline.maxTotalThreadsPerThreadgroup || block*16 > device.maxThreadgroupMemoryLength { block /= 2 }
                 }
                 let finalBlock = axis == 1 && block == n && finish != nil
+                guard let e = profiledCompute(command, profile, stage, "\(name)_axis\(axis)_tile\(block)") else {
+                    throw RenderError.unavailable("无法创建分块 FFT 指令。")
+                }
                 p.span = UInt32(block)
                 e.label = name
                 e.setComputePipelineState(pipeline)
@@ -146,10 +193,11 @@ final class LensResponse {
                 let finalStage = axis == 1 && span == n && finish != nil
                 var textures = [(0,source),(1,finalStage ? finish!.target:scratch)]
                 if finalStage { textures.append((2,finish!.scene)) }
-                try encode(finalStage ? "fftStagePairFinish":(useReferenceFFT ? "fftStage":"fftStagePair"),command:command,
+                let name = finalStage ? "fftStagePairFinish":(useReferenceFFT ? "fftStage":"fftStagePair")
+                try encode(name,command:command,
                            textures:textures,params:p,
                            width:source.width / (!useReferenceFFT && axis == 0 ? 2:1),
-                           height:source.height / (!useReferenceFFT && axis == 1 ? 2:1))
+                           height:source.height / (!useReferenceFFT && axis == 1 ? 2:1),profile:profile,stage:stage)
                 if finalStage { return }
                 swap(&source,&scratch); span *= 2
             }
@@ -200,8 +248,9 @@ final class LensResponse {
     }
     func apply(command: MTLCommandBuffer, scene: MTLTexture, target: MTLTexture,
                glow: Double, scale: Double, measured: MeasuredPSF?, revision: Int,
-               override: (Int,[Float])? = nil) throws {
-        let key = "\(scene.width)x\(scene.height):\(glow):\(scale):\(revision):\(override != nil):\(useReferenceFFT):\(useReferenceCore):\(useFusedPasses)"
+               override: (Int,[Float])? = nil, profile: FrameProfile? = nil) throws {
+        profile?.beginCPU("psf_prepare")
+        let key = "\(scene.width)x\(scene.height):\(glow):\(scale):\(revision):\(override != nil):\(useReferenceFFT):\(useReferenceCore):\(useFusedPasses):\(compactPSF)"
         let rebuild = key != cachedKey || override != nil
         if rebuild {
             if let measured, Double(measured.size/2)*measured.pitchAt800*Double(scene.height)/800*scale > 512 {
@@ -221,8 +270,12 @@ final class LensResponse {
             let padding = useReferenceFFT ? kernelSize-1:kernelSize/2
             let w = power2(max(scene.width+padding,kernelSize))
             let h = power2(max(scene.height+padding,kernelSize))
-            if a?.width != w || a?.height != h {
-                a = try texture(w,h); b = try texture(w,h); spectrum = try texture(w,h)
+            let spectrumFormat: MTLPixelFormat = compactPSF ? .rg32Float:.rgba32Float
+            let resize = a?.width != w || a?.height != h
+            if resize || spectrum?.pixelFormat != spectrumFormat {
+                if resize { a = try texture(w,h); b = try texture(w,h) }
+                spectrum = try texture(w,h,format:spectrumFormat)
+                allocationCount += 1
             }
             paddingWidth = w; paddingHeight = h
         }
@@ -231,22 +284,33 @@ final class LensResponse {
             let data = kernel.withUnsafeBytes {device.makeBuffer(bytes:$0.baseAddress!,length:$0.count,options:.storageModeShared)}
             guard let data else {throw RenderError.unavailable("无法创建 PSF 缓冲区。")}
             var p = FFTParameters(source.width,source.height);p.kernelSize=UInt32(kernelSize)
-            try encode("fftLoadKernel",command:command,textures:[(0,source)],params:p,paramIndex:1,buffer:data,width:source.width,height:source.height)
-            try fft(command:command,source:&source,scratch:&scratch,inverse:false)
-            guard let blit=command.makeBlitCommandEncoder() else {throw RenderError.unavailable("无法缓存 PSF。")}
-            blit.copy(from:source,to:spectrum);blit.endEncoding()
+            try encode("fftLoadKernel",command:command,textures:[(0,source)],params:p,paramIndex:1,buffer:data,width:source.width,height:source.height,profile:profile,stage:"psf_kernel")
+            try fft(command:command,source:&source,scratch:&scratch,inverse:false,profile:profile,stage:"psf_kernel")
+            if compactPSF {
+                // XY and ZW were identical; all consumers read XY only.
+                // RG32 preserves both Float32 components without quantization.
+                try encode("fftStoreSpectrum",command:command,textures:[(0,source),(1,spectrum)],
+                           width:source.width,height:source.height,profile:profile,stage:"psf_kernel")
+            } else {
+                guard let blit=profiledBlit(command, profile, "psf_kernel", "spectrum_copy") else {throw RenderError.unavailable("无法缓存 PSF。")}
+                blit.copy(from:source,to:spectrum);blit.endEncoding()
+            }
+            kernelBuildCount += 1
         }
+        profile?.endCPU("psf_prepare")
+        profile?.beginCPU("psf_convolution")
         if useFusedPasses && !useReferenceFFT {
-            try fft(command:command,source:&source,scratch:&scratch,inverse:false,sceneInput:scene)
-            try fft(command:command,source:&source,scratch:&scratch,inverse:true,multiply:spectrum,finish:(scene,target))
+            try fft(command:command,source:&source,scratch:&scratch,inverse:false,sceneInput:scene,profile:profile)
+            try fft(command:command,source:&source,scratch:&scratch,inverse:true,multiply:spectrum,finish:(scene,target),profile:profile)
         } else {
-            try encode("fftLoadScene",command:command,textures:[(0,scene),(1,source)],width:source.width,height:source.height)
-            try fft(command:command,source:&source,scratch:&scratch,inverse:false)
-            try encode("fftMultiply",command:command,textures:[(0,source),(1,spectrum),(2,scratch)],width:source.width,height:source.height)
+            try encode("fftLoadScene",command:command,textures:[(0,scene),(1,source)],width:source.width,height:source.height,profile:profile)
+            try fft(command:command,source:&source,scratch:&scratch,inverse:false,profile:profile)
+            try encode("fftMultiply",command:command,textures:[(0,source),(1,spectrum),(2,scratch)],width:source.width,height:source.height,profile:profile)
             swap(&source,&scratch)
-            try fft(command:command,source:&source,scratch:&scratch,inverse:true)
-            try encode("fftFinish",command:command,textures:[(0,source),(1,scene),(2,target)],width:target.width,height:target.height)
+            try fft(command:command,source:&source,scratch:&scratch,inverse:true,profile:profile)
+            try encode("fftFinish",command:command,textures:[(0,source),(1,scene),(2,target)],width:target.width,height:target.height,profile:profile)
         }
+        profile?.endCPU("psf_convolution")
         cachedKey = key
     }
 }

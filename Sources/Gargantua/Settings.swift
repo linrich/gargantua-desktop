@@ -34,40 +34,56 @@ enum DiskPalette: String, CaseIterable, Identifiable {
     var saturation: Double { self == .silver ? 0 : (self == .gold ? 1 : 1.15) }
 }
 
+// Effects consumed by OverlayController. GPU caches still use their exact
+// parameter keys; these flags avoid unrelated window/capture work.
+struct SettingsChange: OptionSet {
+    let rawValue: Int
+    static let appearance = Self(rawValue: 1 << 0)
+    static let layout = Self(rawValue: 1 << 1)
+    static let playback = Self(rawValue: 1 << 2)
+    static let window = Self(rawValue: 1 << 3)
+    static let desktop = Self(rawValue: 1 << 4)
+    static let all: Self = [.appearance, .layout, .playback, .window, .desktop]
+}
+
 final class Settings: ObservableObject {
     // App-local preferences only. No login items, telemetry, network, or global input hooks.
     private let defaults: UserDefaults
     private let persistent: Bool
-    var onChange: (() -> Void)?
-    @Published var size: Double { didSet { changed() } }
-    @Published var inclination: Double { didSet { changed() } }
-    @Published var brightness: Double { didSet { changed() } }
-    @Published var glow: Double { didSet { changed() } }
-    @Published var speed: Double { didSet { changed() } }
-    @Published var spin: Double { didSet { changed() } }
-    @Published var relativistic: Bool { didSet { changed() } }
-    @Published var beamFiltering: Bool { didSet { changed() } }
-    @Published var lensResponse: Bool { didSet { changed() } }
-    @Published var shutterAngle: Double { didSet { changed() } }
-    @Published var lensScale: Double { didSet { changed() } }
-    @Published var diskHue: Double { didSet { changed() } }
-    @Published var diskSaturation: Double { didSet { changed() } }
+    var onChange: ((SettingsChange) -> Void)?
+    private let preferenceWriter: ((String, Any) -> Void)?
+    private var batchDepth = 0
+    private var pendingChanges: SettingsChange = []
+    private var pendingWrites: [String: Any] = [:]
+    @Published var size: Double { didSet { changed("size", value: size, old: oldValue, effects: [.layout, .playback, .desktop, .appearance]) } }
+    @Published var inclination: Double { didSet { changed("inclination", value: inclination, old: oldValue, effects: [.appearance, .desktop]) } }
+    @Published var brightness: Double { didSet { changed("brightness", value: brightness, old: oldValue, effects: [.appearance]) } }
+    @Published var glow: Double { didSet { changed("glow", value: glow, old: oldValue, effects: [.appearance]) } }
+    @Published var speed: Double { didSet { changed("speed", value: speed, old: oldValue, effects: [.playback, .appearance]) } }
+    @Published var spin: Double { didSet { changed("spin", value: spin, old: oldValue, effects: [.appearance, .desktop]) } }
+    @Published var relativistic: Bool { didSet { changed("relativistic", value: relativistic, old: oldValue, effects: [.appearance]) } }
+    @Published var beamFiltering: Bool { didSet { changed("beamFiltering", value: beamFiltering, old: oldValue, effects: [.appearance]) } }
+    @Published var lensResponse: Bool { didSet { changed("lensResponse", value: lensResponse, old: oldValue, effects: [.appearance]) } }
+    @Published var shutterAngle: Double { didSet { changed("shutterAngle", value: shutterAngle, old: oldValue, effects: [.appearance]) } }
+    @Published var lensScale: Double { didSet { changed("lensScale", value: lensScale, old: oldValue, effects: [.appearance]) } }
+    @Published var diskHue: Double { didSet { changed("diskHue", value: diskHue, old: oldValue, effects: [.appearance]) } }
+    @Published var diskSaturation: Double { didSet { changed("diskSaturation", value: diskSaturation, old: oldValue, effects: [.appearance]) } }
     @Published var psfLabel = "合成镜头响应"
     @Published var psfError: String?
     var measuredPSF: MeasuredPSF?
     var psfRevision = 0
-    @Published var quality: RenderQuality { didSet { changed() } }
-    @Published var clickThrough: Bool { didSet { changed() } }
-    @Published var alwaysOnTop: Bool { didSet { changed() } }
-    @Published var visible = true { didSet { onChange?() } }
-    @Published var paused = false { didSet { onChange?() } }
+    @Published var quality: RenderQuality { didSet { changed("quality", value: quality.rawValue, old: oldValue.rawValue, effects: [.layout, .playback, .desktop, .appearance]) } }
+    @Published var clickThrough: Bool { didSet { changed("clickThrough", value: clickThrough, old: oldValue, effects: [.window]) } }
+    @Published var alwaysOnTop: Bool { didSet { changed("alwaysOnTop", value: alwaysOnTop, old: oldValue, effects: [.window, .desktop]) } }
+    @Published var visible = true { didSet { if visible != oldValue { notify([.playback, .window, .desktop, .appearance]) } } }
+    @Published var paused = false { didSet { if paused != oldValue { notify([.playback, .appearance]) } } }
     @Published var rendererError: String?
     @Published var renderResolution = ""
     @Published var displayedWidth = 0.0
     @Published var maximumSize = OverlaySizing.minimum
     // Explicit opt-in per launch. Never persist capture enablement.
-    @Published var desktopLensing = false {didSet {onChange?()}}
-    @Published var desktopStrength = 0.65 {didSet {onChange?()}}
+    @Published var desktopLensing = false { didSet { if desktopLensing != oldValue { notify([.layout, .playback, .desktop, .appearance]) } } }
+    @Published var desktopStrength = 0.65 { didSet { if desktopStrength != oldValue { notify([.desktop, .appearance]) } } }
     @Published var desktopStatus = "未采集桌面"
 
     func setDesktopLensing(_ enabled: Bool) {
@@ -86,7 +102,8 @@ final class Settings: ObservableObject {
         shutterAngle/360/Double(targetFPS)*effectiveSpeed
     }
 
-    init(persistent: Bool = true) {
+    init(persistent: Bool = true, preferenceWriter: ((String, Any) -> Void)? = nil) {
+        self.preferenceWriter = preferenceWriter
         self.persistent = persistent
         let storage = persistent ? UserDefaults.standard : UserDefaults(suiteName: "local.gargantua.snapshot")!
         defaults = storage
@@ -115,34 +132,39 @@ final class Settings: ObservableObject {
         alwaysOnTop = storage.bool(forKey: "alwaysOnTop")
     }
 
-    private func changed() {
-        guard persistent else { onChange?(); return }
-        defaults.set(size, forKey: "size")
-        defaults.set(inclination, forKey: "inclination")
-        defaults.set(brightness, forKey: "brightness")
-        defaults.set(glow, forKey: "glow")
-        defaults.set(speed, forKey: "speed")
-        defaults.set(spin, forKey: "spin")
-        defaults.set(relativistic, forKey: "relativistic")
-        defaults.set(beamFiltering, forKey: "beamFiltering")
-        defaults.set(lensResponse, forKey: "lensResponse")
-        defaults.set(shutterAngle, forKey: "shutterAngle")
-        defaults.set(lensScale, forKey: "lensScale")
-        defaults.set(diskHue, forKey: "diskHue")
-        defaults.set(diskSaturation, forKey: "diskSaturation")
-        defaults.set(quality.rawValue, forKey: "quality")
-        defaults.set(clickThrough, forKey: "clickThrough")
-        defaults.set(alwaysOnTop, forKey: "alwaysOnTop")
-        onChange?()
+    private func changed<T: Equatable>(_ key: String, value: T, old: T, effects: SettingsChange) {
+        guard value != old else { return }
+        pendingWrites[key] = value
+        notify(effects)
+    }
+    private func notify(_ effects: SettingsChange) {
+        pendingChanges.formUnion(effects)
+        if batchDepth == 0 { flushChanges() }
+    }
+    private func flushChanges() {
+        let changes = pendingChanges, writes = pendingWrites
+        pendingChanges = []; pendingWrites = [:]
+        for (key, value) in writes {
+            if let preferenceWriter { preferenceWriter(key, value) }
+            else if persistent { defaults.set(value, forKey: key) }
+        }
+        if !changes.isEmpty { onChange?(changes) }
+    }
+    func batchUpdates(_ action: () -> Void) {
+        batchDepth += 1
+        defer { batchDepth -= 1; if batchDepth == 0 { flushChanges() } }
+        action()
     }
 
     func restoreAppearance() {
-        size = OverlaySizing.minimum; inclination = 8; brightness = 1.3; glow = 0.65
-        speed = MotionTuning.defaultSpeed; quality = .balanced
-        spin = 0; relativistic = false
-        beamFiltering = true; lensResponse = true; shutterAngle = 180; lensScale = 1
-        setPalette(.gold)
-        resetPSF()
+        batchUpdates {
+            size = OverlaySizing.minimum; inclination = 8; brightness = 1.3; glow = 0.65
+            speed = MotionTuning.defaultSpeed; quality = .balanced
+            spin = 0; relativistic = false
+            beamFiltering = true; lensResponse = true; shutterAngle = 180; lensScale = 1
+            setPalette(.gold)
+            resetPSF()
+        }
     }
 
     func updateSizeLimit(screenSize: CGSize) {
@@ -152,12 +174,14 @@ final class Settings: ObservableObject {
     }
 
     func setMovieParameters() {
-        spin=0.6;relativistic=false;inclination=8
-        beamFiltering=true;lensResponse=true;shutterAngle=180
+        batchUpdates {
+            spin=0.6;relativistic=false;inclination=8
+            beamFiltering=true;lensResponse=true;shutterAngle=180
+        }
     }
 
     func setPalette(_ palette: DiskPalette) {
-        diskHue = palette.hue; diskSaturation = palette.saturation
+        batchUpdates { diskHue = palette.hue; diskSaturation = palette.saturation }
     }
     var selectedPalette: DiskPalette? {
         DiskPalette.allCases.first { abs(diskHue-$0.hue)<0.001 && abs(diskSaturation-$0.saturation)<0.001 }
@@ -165,7 +189,7 @@ final class Settings: ObservableObject {
 
     func resetPSF() {
         measuredPSF = nil; psfRevision += 1; psfLabel = "合成镜头响应"; psfError = nil
-        onChange?()
+        notify([.appearance])
     }
     func choosePSF() {
         let panel = NSOpenPanel()
@@ -174,7 +198,7 @@ final class Settings: ObservableObject {
         if panel.runModal() == .OK, let url = panel.url {
             do {
                 measuredPSF = try MeasuredPSF.read(url); psfRevision += 1
-                psfLabel = url.lastPathComponent; psfError = nil; onChange?()
+                psfLabel = url.lastPathComponent; psfError = nil; notify([.appearance])
             } catch { psfError = error.localizedDescription }
         }
     }
