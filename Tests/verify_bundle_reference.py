@@ -6,10 +6,11 @@ Uses the affine Hamiltonian CPU solver, not the GPU polynomial/AD equations.
 """
 import json
 import math
+import sys
 from pathlib import Path
 from verify_kerr_reference import reference
 
-root = Path('build/verification')
+root = Path(sys.argv[1] if len(sys.argv) > 1 else 'build/verification')
 data = json.loads((root/'ray-bundles.json').read_text())
 comparisons = []
 max_error = [0.0]*4
