@@ -3,18 +3,18 @@
 # SPDX-License-Identifier: GPL-3.0-only
 set -euo pipefail
 PROJECT_DIR="${0:A:h:h}"
-if (( $# != 1 )); then
-    print -u2 "用法：zsh Scripts/sign-app.sh /path/to/Gargantua.app"
+if (( $# < 1 || $# > 2 )) || [[ $# == 2 && "$2" != "--ad-hoc" ]]; then
+    print -u2 "用法：zsh Scripts/sign-app.sh /path/to/Gargantua.app [--ad-hoc]"
     exit 2
 fi
 APP_DIR="$1"
-CONFIG="$PROJECT_DIR/Signing/LocalSigning.plist"
-if [[ ! -e "$CONFIG" && ! -L "$CONFIG" ]]; then
-    print "未配置固定证书：使用仅供本地开发的 ad hoc 签名。"
+# Explicit local mode never reads personal signing configuration or Keychain.
+if [[ "${2:-}" == "--ad-hoc" ]] || [[ ! -e "$PROJECT_DIR/Signing/LocalSigning.plist" && ! -L "$PROJECT_DIR/Signing/LocalSigning.plist" ]]; then
     /usr/bin/codesign --force --sign - --timestamp=none "$APP_DIR"
-    python3 "$PROJECT_DIR/Scripts/verify_signing.py" "$APP_DIR"
+    python3 "$PROJECT_DIR/Scripts/verify_signing.py" "$APP_DIR" --ad-hoc
     exit 0
 fi
+CONFIG="$PROJECT_DIR/Signing/LocalSigning.plist"
 CERTIFICATE_SHA1="$(/usr/libexec/PlistBuddy -c 'Print :CertificateSHA1' "$CONFIG")"
 BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :BundleIdentifier' "$CONFIG")"
 if [[ ! "$CERTIFICATE_SHA1" =~ '^[A-F0-9]{40}$' ]]; then
