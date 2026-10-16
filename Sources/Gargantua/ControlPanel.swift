@@ -8,6 +8,8 @@ struct ControlPanel: View {
     @ObservedObject var settings: Settings
     var center: () -> Void
     var quit: () -> Void
+    var createTrashTestFile: () -> Void
+    var recycleDiagnostics = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 19) {
@@ -44,6 +46,29 @@ struct ControlPanel: View {
                         .frame(maxWidth: .infinity)
                 }
             }.controlSize(.large)
+            VStack(alignment: .leading, spacing: 9) {
+                Toggle("接收拖放与吞入动画", isOn: $settings.dropPreviewEnabled)
+                    .toggleStyle(.switch).controlSize(.small)
+                Toggle("允许回收普通文件和文件夹", isOn: $settings.realTrashEnabled)
+                    .toggleStyle(.switch).controlSize(.small)
+                    .disabled(!settings.dropPreviewEnabled)
+                    .accessibilityIdentifier("allow-real-trash")
+                Text(settings.realTrashEnabled
+                     ? "真实回收已开启：松手后移入系统废纸篓，成功后播放坠入、粉碎与光线。可在废纸篓中找回。"
+                     : (recycleDiagnostics
+                        ? "真实回收已关闭：普通文件只播放动画，留在原处。下方按钮生成的专用测试文件仍可回收。"
+                        : "真实回收已关闭：文件和文件夹只播放动画，留在原处。"))
+                    .font(.system(size: 11)).foregroundStyle(settings.realTrashEnabled ? gold : .secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if recycleDiagnostics {
+                    Button("生成新的回收测试文件", action: createTrashTestFile)
+                        .font(.system(size: 11))
+                    TrashFileControl(url: settings.trashTestFileURL).frame(height: 60)
+                }
+                Toggle("减少动态效果", isOn: $settings.reduceDropMotion)
+                    .toggleStyle(.checkbox).font(.system(size: 11))
+                Text(settings.dropStatus).font(.system(size: 10)).foregroundStyle(.secondary)
+            }.padding(12).background(gold.opacity(0.055), in: RoundedRectangle(cornerRadius: 10))
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
                     Text("KERR · 旋转黑洞").font(.system(size: 11, weight: .medium, design: .monospaced)).foregroundStyle(gold)
@@ -154,14 +179,21 @@ struct ControlPanel: View {
                 Text("开启后读取所在显示器的实时画面，包含控制台及其他可见窗口；排除黑洞及透镜效果窗口，不采集音频，不保存或上传。每次启动默认关闭。")
                     .font(.system(size:10)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
                 Text(settings.desktopStatus).font(.system(size:10)).foregroundStyle(.secondary)
+                if settings.desktopPermissionNeedsAttention {
+                    Button("打开屏幕录制设置") {
+                        NSWorkspace.shared.open(ScreenCapturePermission.settingsURL)
+                    }.font(.system(size: 11))
+                }
                 if settings.desktopLensing {
                     Text("暂停时间只冻结盘面；桌面仍实时更新。关闭此开关可停止采集。")
                         .font(.system(size:10)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
                 }
-                Toggle("鼠标穿透", isOn: $settings.clickThrough)
+                Toggle("鼠标穿透", isOn: Binding(get: { settings.effectiveClickThrough },
+                                              set: { settings.setClickThrough($0) }))
+                    .accessibilityIdentifier("mouse-click-through")
                 Toggle("始终显示在其他窗口上方", isOn: $settings.alwaysOnTop)
             }.toggleStyle(.switch).controlSize(.small).font(.system(size: 12))
-            Text(settings.clickThrough ? "鼠标穿透已开启，可正常操作下方桌面。关闭后拖动黑洞，双击打开此面板。" : "拖动黑洞区域可移动位置；双击可打开面板。窗口的透明区域也会接收鼠标操作。")
+            Text(settings.dropPreviewEnabled ? "开启鼠标穿透将关闭拖放接收和真实回收。" : (settings.clickThrough ? "鼠标穿透已开启，可正常操作下方桌面。关闭后拖动黑洞，双击打开此面板。" : "拖动黑洞区域可移动位置；双击可打开面板。"))
                 .font(.system(size: 11)).foregroundStyle(.secondary).lineSpacing(3)
                 .fixedSize(horizontal: false, vertical: true)
             if let error = settings.rendererError {
@@ -183,6 +215,16 @@ struct ControlPanel: View {
         .background(LinearGradient(colors: [Color(red: 0.095, green: 0.096, blue: 0.112), Color(red: 0.045, green: 0.05, blue: 0.064)], startPoint: .topLeading, endPoint: .bottomTrailing))
         .tint(gold).preferredColorScheme(.dark)
     }
+}
+
+private struct TrashFileControl: NSViewRepresentable {
+    let url: URL?
+    func makeNSView(context: Context) -> TestFileDragView {
+        let view = TestFileDragView(frame: CGRect(x: 0, y: 0, width: 300, height: 60))
+        view.setAccessibilityLabel("拖动本次生成的回收测试文件")
+        view.fileURL = url; return view
+    }
+    func updateNSView(_ view: TestFileDragView, context: Context) { view.fileURL = url }
 }
 
 private struct ValueSlider: View {

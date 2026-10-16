@@ -50,6 +50,7 @@ final class Settings: ObservableObject {
     // App-local preferences only. No login items, telemetry, network, or global input hooks.
     private let defaults: UserDefaults
     private let persistent: Bool
+    private let screenCapturePermission: ScreenCapturePermission
     var onChange: ((SettingsChange) -> Void)?
     private let preferenceWriter: ((String, Any) -> Void)?
     private var batchDepth = 0
@@ -85,14 +86,41 @@ final class Settings: ObservableObject {
     @Published var desktopLensing = false { didSet { if desktopLensing != oldValue { notify([.layout, .playback, .desktop, .appearance]) } } }
     @Published var desktopStrength = 0.65 { didSet { if desktopStrength != oldValue { notify([.desktop, .appearance]) } } }
     @Published var desktopStatus = "未采集桌面"
+    @Published var desktopPermissionNeedsAttention = false
+    // Reception and real recycling are separate. Real recycling is off on every launch.
+    @Published var dropPreviewEnabled = true { didSet {
+        if !dropPreviewEnabled { realTrashEnabled = false }
+        if dropPreviewEnabled != oldValue { notify([.window]) }
+    } }
+    @Published var realTrashEnabled = false { didSet {
+        if realTrashEnabled != oldValue { notify([.window]) }
+    } }
+    var dropReadyStatus: String {
+        realTrashEnabled ? "真实回收已开启 · 拖入后抖动，松手移入系统废纸篓" : "真实回收已关闭 · 普通文件只演示，留在原处"
+    }
+    @Published var reduceDropMotion = false { didSet { if reduceDropMotion != oldValue { notify([.window]) } } }
+    @Published var dropStatus = "拖入黑洞后抖动，松手演示吞入；文件留在原处"
+    @Published var trashTestFileURL: URL?
 
+    var effectiveClickThrough: Bool { clickThrough && !dropPreviewEnabled }
+    func setClickThrough(_ enabled: Bool) {
+        // Native fully transparent input cannot also receive an AppKit drop.
+        // A direct switch action selects passthrough and disarms recycling.
+        batchUpdates {
+            if enabled { dropPreviewEnabled = false }
+            clickThrough = enabled
+        }
+    }
     func setDesktopLensing(_ enabled: Bool) {
-        if enabled && !CGPreflightScreenCaptureAccess() && !CGRequestScreenCaptureAccess() {
-            desktopStatus="需要在系统设置的屏幕录制权限中允许 Gargantua，然后重新打开此开关。"
+        desktopPermissionNeedsAttention = false
+        if enabled && !screenCapturePermission.ensureAccess() {
+            desktopLensing = false
+            desktopPermissionNeedsAttention = true
+            desktopStatus = ScreenCapturePermission.deniedMessage
             return
         }
-        desktopLensing=enabled
-        if !enabled {desktopStatus="未采集桌面"}
+        desktopLensing = enabled
+        if !enabled { desktopStatus = "未采集桌面" }
     }
     var effectiveSpeed: Double {
         MotionTuning.effectiveSpeed(speed,width:displayedWidth>0 ? displayedWidth : size)
@@ -102,7 +130,9 @@ final class Settings: ObservableObject {
         shutterAngle/360/Double(targetFPS)*effectiveSpeed
     }
 
-    init(persistent: Bool = true, preferenceWriter: ((String, Any) -> Void)? = nil) {
+    init(persistent: Bool = true, preferenceWriter: ((String, Any) -> Void)? = nil,
+         screenCapturePermission: ScreenCapturePermission = .system) {
+        self.screenCapturePermission = screenCapturePermission
         self.preferenceWriter = preferenceWriter
         self.persistent = persistent
         let storage = persistent ? UserDefaults.standard : UserDefaults(suiteName: "local.gargantua.snapshot")!

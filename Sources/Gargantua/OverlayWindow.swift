@@ -26,6 +26,9 @@ final class OverlayController {
     let window: FloatingPanel
     let view: TransparentMetalView
     let renderer: BlackHoleRenderer
+    let dropCanvas: DropCanvas
+    let trashTestSession = TestTrashSession()
+    private let dropGeometry: DropGeometryLoader
     private let backgroundWindow: FloatingPanel
     private let backgroundView: MTKView
     private let backgroundRenderer: BlackHoleRenderer
@@ -39,15 +42,22 @@ final class OverlayController {
     }
     private var desktopDisplayID: CGDirectDisplayID=0
     private let settings: Settings
+    private let persistPosition: Bool
+    private let recycleDiagnostics: Bool
     private var asleep = false
     private var sessionInactive = false
     private var applying = false
     private var observers: [NSObjectProtocol] = []
     var onOpenControls: (() -> Void)?
 
-    init(settings: Settings) throws {
+    init(settings: Settings, restorePosition: Bool = true, recycleDiagnostics: Bool = false) throws {
         self.settings = settings
+        self.recycleDiagnostics = recycleDiagnostics
+        persistPosition = restorePosition
         renderer = try BlackHoleRenderer(settings: settings)
+        let geometry = DropGeometry(spin: settings.spin, inclination: settings.inclination)
+        let initialMap = try DiskHitMap.make(renderer: renderer, geometry: geometry)
+        dropGeometry = DropGeometryLoader(renderer: renderer, geometry: geometry)
         backgroundRenderer = try BlackHoleRenderer(settings:settings,backgroundOnly:true,resources:renderer.resources)
         desktopCapture = DesktopCapture(device:renderer.device)
         let initialScreen=NSScreen.main?.frame.size ?? NSSize(width:1440,height:900)
@@ -73,6 +83,10 @@ final class OverlayController {
         view.layer?.backgroundColor = NSColor.clear.cgColor
         view.autoResizeDrawable = false
         view.delegate = renderer
+        dropCanvas = DropCanvas(frame: view.bounds, hitMap: initialMap)
+        if recycleDiagnostics { dropCanvas.trashSession = trashTestSession }
+        dropCanvas.autoresizingMask = [.width, .height]
+        view.addSubview(dropCanvas)
         window.contentView = view
         backgroundWindow=FloatingPanel(contentRect:NSRect(origin:.zero,size:initialScreen),
             styleMask:[.borderless,.nonactivatingPanel],backing:.buffered,defer:false)
@@ -92,6 +106,20 @@ final class OverlayController {
         // update only its local lens viewport, never translate captured pixels.
         backgroundView.presentsWithTransaction=true
         backgroundWindow.contentView=backgroundView
+        dropCanvas.onMouseDown = { [weak view] event in view?.mouseDown(with: event) }
+        dropCanvas.onStatus = { [weak settings] text in settings?.dropStatus = text }
+        dropGeometry.onResult = { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let map):
+                self.dropCanvas.hitMap = map
+                self.updateDropAvailability()
+                self.settings.dropStatus = self.settings.dropReadyStatus
+            case .failure:
+                self.dropCanvas.receptionEnabled = false
+                self.settings.dropStatus = "接收范围更新失败，已暂停拖放演示"
+            }
+        }
         view.onOpenControls = { [weak self] in self?.onOpenControls?() }
         view.onMoveEnded = { [weak self] in self?.savePosition() }
         view.onMoveBegan = { [weak self] in self?.raiseTogether() }
@@ -106,8 +134,9 @@ final class OverlayController {
         desktopCapture.onStatus = { [weak settings] in settings?.desktopStatus=$0 }
         desktopCapture.onFailure = { [weak settings] message in
             settings?.desktopLensing=false;settings?.desktopStatus=message
+            settings?.desktopPermissionNeedsAttention = message == ScreenCapturePermission.deniedMessage
         }
-        if let saved = UserDefaults.standard.string(forKey: "overlayPosition") {
+        if restorePosition, let saved = UserDefaults.standard.string(forKey: "overlayPosition") {
             let point = NSPointFromString(saved)
             if point.x.isFinite && point.y.isFinite { window.setFrameOrigin(point) }
         } else { center() }
@@ -116,6 +145,7 @@ final class OverlayController {
             guard let self else { return }
             self.settings.rendererError = message
             self.view.isPaused = true
+            self.dropCanvas.receptionEnabled = false
             self.desktopCapture.stop()
             self.settings.desktopLensing=false
             self.settings.desktopStatus="渲染停止，桌面采集已关闭"
@@ -179,6 +209,7 @@ final class OverlayController {
             let width = min(CGFloat(settings.size),OverlaySizing.maximumWidth(in:available))
             let size = NSSize(width: width, height: width / OverlaySizing.aspect)
             if abs(old.width - width) > 0.5 {
+                dropCanvas.stop()
                 window.setFrame(NSRect(x: old.midX - size.width / 2, y: old.midY - size.height / 2,
                                        width: size.width, height: size.height), display: true)
                 keepOnScreen()
@@ -205,11 +236,21 @@ final class OverlayController {
             if settings.renderResolution != resolution { settings.renderResolution = resolution }
         }
         if changes.contains(.window) {
-            if window.ignoresMouseEvents != settings.clickThrough { window.ignoresMouseEvents = settings.clickThrough }
+            // Native drag destinations are skipped by WindowServer when full
+            // mouse passthrough is on. Reserve input only while preview is on;
+            // preserve the user's stored passthrough preference for afterwards.
+            let passThrough = settings.effectiveClickThrough
+            if window.ignoresMouseEvents != passThrough { window.ignoresMouseEvents = passThrough }
             let level: NSWindow.Level = settings.alwaysOnTop ? .floating : .normal
             if window.level != level { window.level = level }
             if settings.visible { raiseTogether() } else { window.orderOut(nil) }
         }
+        let geometry = DropGeometry(spin: settings.spin, inclination: settings.inclination)
+        if dropGeometry.update(geometry) {
+            dropCanvas.receptionEnabled = false
+            settings.dropStatus = "正在更新拖入范围…"
+        }
+        updateDropAvailability()
         if changes.contains(.playback) {
             view.preferredFramesPerSecond = settings.targetFPS
             renderer.suspended = !settings.visible || asleep || sessionInactive
@@ -220,6 +261,23 @@ final class OverlayController {
         if changes.contains(.desktop) { updateDesktop() }
         if !changes.intersection([.appearance, .layout, .playback]).isEmpty &&
             (settings.paused || settings.speed == 0) && !renderer.suspended && settings.rendererError == nil { view.draw() }
+    }
+
+    private func updateDropAvailability() {
+        let enabled = settings.dropPreviewEnabled && settings.visible && !asleep && !sessionInactive
+            && settings.rendererError == nil && dropGeometry.requested == dropGeometry.applied
+        if dropCanvas.receptionEnabled != enabled { dropCanvas.receptionEnabled = enabled }
+        if dropCanvas.realTrashEnabled != settings.realTrashEnabled { dropCanvas.realTrashEnabled = settings.realTrashEnabled }
+        dropCanvas.reduceMotionOverride = settings.reduceDropMotion
+    }
+
+    func playDropDemo() { dropCanvas.playDemo() }
+    func createTrashTestFile() {
+        guard recycleDiagnostics else { return }
+        do {
+            settings.trashTestFileURL = try trashTestSession.createFixture()
+            settings.dropStatus = "已生成专用测试文件；拖动 TEST 图标到黑洞，松手真实回收"
+        } catch { settings.dropStatus = "测试文件生成失败；请稍后重新生成" }
     }
 
     func center() {
@@ -250,7 +308,7 @@ final class OverlayController {
     }
 
     private func savePosition() {
-        UserDefaults.standard.set(NSStringFromPoint(window.frame.origin), forKey: "overlayPosition")
+        if persistPosition { UserDefaults.standard.set(NSStringFromPoint(window.frame.origin), forKey: "overlayPosition") }
         updateDesktop()
     }
 
@@ -300,7 +358,7 @@ final class OverlayController {
         if settings.desktopLensing && !active {settings.desktopStatus="已暂停桌面采集（隐藏、休眠或扭曲强度为 0）"}
     }
 
-    func stopCapture() {backgroundEvents.setActive(false,fps:30);desktopCapture.stop()}
+    func stopCapture() {dropCanvas.stop();backgroundEvents.setActive(false,fps:30);desktopCapture.stop()}
 
     deinit {
         backgroundEvents.setActive(false,fps:30)

@@ -54,7 +54,7 @@ final class DesktopCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         guard let displayID else {return}
         // Permission is requested only by the explicit control-panel action.
         guard CGPreflightScreenCaptureAccess() else {
-            onFailure?("需要屏幕录制授权；请打开桌面引力透镜开关后按系统提示处理。")
+            onFailure?(ScreenCapturePermission.deniedMessage)
             return
         }
         wantedDisplay=displayID
@@ -103,7 +103,7 @@ final class DesktopCapture: NSObject, SCStreamOutput, SCStreamDelegate {
             } catch {
                 guard self.generation==request else {return}
                 self.stop()
-                self.onFailure?("桌面采集不可用：\(error.localizedDescription)")
+                self.onFailure?(ScreenCapturePermission.isDenied(error) ? ScreenCapturePermission.deniedMessage : "桌面采集不可用：\(error.localizedDescription)")
             }
         }
     }
